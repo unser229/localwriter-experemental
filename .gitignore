@@ -1,1 +1,44 @@
+backend/tests/reports/
+backend/tests/test_docs/
 data/
+# --- 1. Python & System Core (Стандарт) ---
+__pycache__/
+*.py[cod]
+*$py.class
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- 2. Virtual Environments ---
+.env
+.venv/
+venv/
+ENV/
+
+# --- 3. LocalWriter DATA (Базы данных и временные файлы) ---
+# Игнорируем саму папку с данными, но оставляем .gitkeep, если он есть
+backend/data/*
+!backend/data/.gitkeep
+
+# Исключаем векторные базы (они создаются скриптом заново)
+backend/data/test_vector_db/
+backend/data/chroma_db/
+backend/data/temp/
+
+# --- 4. TEST ARTIFACTS (То, что мы сейчас генерировали) ---
+# Отчеты бенчмарков (они нужны только вам в моменте)
+backend/tests/reports/
+backend/tests/validation_reports/
+backend/tests/visual_reports/
+
+# PDF "рентгены" ошибок
+*.pdf
+FAILURES_*.docx
+RAG_VIEW_*.docx
+
+# Сырые CSV
+*.csv
+
+# --- 5. Logs ---
+*.log

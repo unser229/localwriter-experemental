@@ -2,13 +2,35 @@ import shutil
 import os
 import uuid
 import json
+from typing import List, Optional  # <--- ДОБАВЛЕН ЭТОТ ИМПОРТ
 from fastapi import APIRouter, Request, Header, UploadFile, File
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from app.services.ollama_client import get_tags, stream_completion
 from app.services.docling_parser import docling_service
 from app.services.rag_engine import rag_engine
+from pydantic import BaseModel
+import subprocess
+
+
 
 router = APIRouter()
+
+# --- DTO классы (модели данных) ---
+class ChatRequest(BaseModel):
+    model: str
+    messages: List[dict]
+    stream: bool = False
+
+class CompletionRequest(BaseModel):
+    model: str
+    prompt: str
+    max_tokens: Optional[int] = 100
+    stream: bool = False
+    format: Optional[str] = None
+    options: Optional[dict] = None
+
+class ContextRequest(BaseModel):
+    text: str
 
 TEMP_DIR = os.path.join(os.getcwd(), "data", "temp")
 os.makedirs(TEMP_DIR, exist_ok=True)
@@ -32,13 +54,11 @@ async def proxy_completions(
     # Переменная для ID шаблона (имя файла на диске)
     best_template_uuid = None
     
-    # --- RAG LOGIC (ИСПРАВЛЕНО) ---
+    # --- RAG LOGIC ---
     
-    # 1. Очищаем промт от системных инструкций, чтобы искать только по сути
+    # 1. Очищаем промт от системных инструкций
     search_query = user_prompt
     
-    # Расширение отправляет промт в формате: SYSTEM: ... USER: ... CONTENT/CONTEXT: ...
-    # Нам нужно то, что в конце
     if "CONTENT/CONTEXT:" in user_prompt:
         search_query = user_prompt.split("CONTENT/CONTEXT:")[-1]
     elif "USER INSTRUCTION:" in user_prompt:
@@ -50,7 +70,6 @@ async def proxy_completions(
 
     # 2. Ищем, если запрос осмысленный
     if len(search_query) > 10:
-        # Обрезаем запрос до 1000 символов для поиска, чтобы не перегружать эмбеддинги
         print(f"🔎 RAG Search Query: '{search_query[:50]}...'")
         search_results = rag_engine.search(search_query[:1000], n_results=1)
         
@@ -66,7 +85,7 @@ async def proxy_completions(
             except Exception as e:
                 print(f"Error extracting metadata: {e}")
 
-            # Модифицируем промт (добавляем найденный текст в начало)
+            # Модифицируем промт
             augmented_prompt = (
                 "SYSTEM: Используй этот контекст стиля и содержания из базы знаний.\n"
                 "CONTEXT:\n"
@@ -93,31 +112,36 @@ async def proxy_completions(
 
 @router.post("/api/ingest")
 async def ingest_document(file: UploadFile = File(...)):
-    file_ext = file.filename.split(".")[-1]
+    file_ext = file.filename.split(".")[-1].lower()
     unique_filename = f"{uuid.uuid4()}.{file_ext}"
     file_path = os.path.join(TEMP_DIR, unique_filename)
     
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    # КОНВЕРТАЦИЯ В DOCX (если это не docx)
+    processing_path = file_path
+    if file_ext != "docx":
+        print(f"🔄 Converting {file_ext} to docx using LibreOffice...")
+        try:
+            # Используем headless libreoffice для конвертации
+            # soffice --headless --convert-to docx filename.pdf --outdir /tmp/...
+            subprocess.run([
+                "soffice", "--headless", "--convert-to", "docx", 
+                file_path, "--outdir", TEMP_DIR
+            ], check=True)
+            
+            processing_path = file_path.replace(f".{file_ext}", ".docx")
+            unique_filename = unique_filename.replace(f".{file_ext}", ".docx")
+        except Exception as e:
+            return JSONResponse({"error": f"Conversion failed: {e}"}, status_code=500)
+
+    # Теперь скармливаем DOCX нашему новому RAG
     try:
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        
-        print(f"📥 Received: {file.filename} -> {unique_filename}")
-        result = docling_service.process_file(file_path)
-        
-        if result["status"] == "success":
-            rag_engine.add_document(
-                filename=file.filename, 
-                markdown_text=result["markdown"],
-                metadata={
-                    "stored_uuid": unique_filename, # Сохраняем связь с файлом
-                    "original_name": file.filename
-                }
-            )
-            return JSONResponse(content={"status": "indexed", "uuid": unique_filename})
-        else:
-            return JSONResponse(content=result, status_code=500)
+        rag_engine.add_document(processing_path, unique_filename)
+        return JSONResponse({"status": "indexed", "uuid": unique_filename})
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 @router.get("/api/download_template/{filename}")
 async def download_template(filename: str):
@@ -125,3 +149,17 @@ async def download_template(filename: str):
     if os.path.exists(file_path):
         return FileResponse(file_path, filename=filename)
     return JSONResponse({"error": "File not found"}, status_code=404)
+
+@router.post("/api/retrieve_context")
+def retrieve_context(request: ContextRequest):
+    try:
+        # Используем новый метод для получения полной картины стиля
+        data = rag_engine.search_style_reference(request.text)
+        if data:
+            return {
+                "context": data["full_context"],
+                "source_id": data["source_id"]
+            }
+        return {"context": "No reference found.", "source_id": None}
+    except Exception as e:
+        return {"context": f"Error: {e}", "source_id": None}

@@ -1,3 +1,4 @@
+#__init__.py
 from fastapi import APIRouter
 from .endpoints import router as endpoints_router
 

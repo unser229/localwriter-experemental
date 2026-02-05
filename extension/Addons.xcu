@@ -1,3 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
 <oor:component-data xmlns:oor="http://openoffice.org/2001/registry" xmlns:xs="http://www.w3.org/2001/XMLSchema" oor:name="Addons" oor:package="org.openoffice.Office">
   <node oor:name="AddonUI">
     <node oor:name="OfficeMenuBar">
@@ -9,6 +10,7 @@
           <value>com.sun.star.sheet.SpreadsheetDocument,com.sun.star.text.GlobalDocument,com.sun.star.text.TextDocument,com.sun.star.text.WebDocument</value>
         </prop>
         <node oor:name="Submenu">
+        
           <node oor:name="M1" oor:op="replace">
             <prop oor:name="Title">
               <value xml:lang="en-US">Extend Selection</value>
@@ -20,7 +22,8 @@
               <value>_self</value>
             </prop>
           </node>
-           <node oor:name="M2" oor:op="replace">
+          
+          <node oor:name="M2" oor:op="replace">
             <prop oor:name="Title">
               <value xml:lang="en-US">Edit Selection</value>
             </prop>
@@ -31,7 +34,8 @@
               <value>_self</value>
             </prop>
           </node>
-            <node oor:name="M3" oor:op="replace">
+          
+          <node oor:name="M3" oor:op="replace">
             <prop oor:name="Title">
               <value xml:lang="en-US">Settings</value>
             </prop>
@@ -41,8 +45,9 @@
             <prop oor:name="Target" oor:type="xs:string">
               <value>_self</value>
             </prop>
-            </node>
-            <node oor:name="M4" oor:op="replace">
+          </node>
+          
+          <node oor:name="M4" oor:op="replace">
             <prop oor:name="Title">
                 <value xml:lang="en-US">Apply Template (Beta)</value>
             </prop>
@@ -53,9 +58,32 @@
                 <value>_self</value>
             </prop>
           </node>
+
+          <node oor:name="M5" oor:op="replace">
+            <prop oor:name="Title">
+                <value xml:lang="en-US">Show Last Debug Report</value>
+            </prop>
+            <prop oor:name="URL">
+                <value>service:org.extension.sample.do?ShowDebug</value>
+            </prop>
+            <prop oor:name="Target" oor:type="xs:string">
+                <value>_self</value>
+            </prop>
+          </node>
+          <node oor:name="M6" oor:op="replace">
+            <prop oor:name="Title">
+                <value xml:lang="en-US">🐞 Report Bug (Select Text)</value>
+            </prop>
+            <prop oor:name="URL">
+                <value>service:org.extension.sample.do?ReportBug</value>
+            </prop>
+            <prop oor:name="Target" oor:type="xs:string">
+                <value>_self</value>
+            </prop>
+          </node>
+
         </node>
       </node>
     </node>
   </node>
 </oor:component-data>
-

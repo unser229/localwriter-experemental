@@ -1,50 +1,44 @@
+#docling_parser.py
 import os
-from pathlib import Path
-from docling.document_converter import DocumentConverter, PdfFormatOption, WordFormatOption
-from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
+from docling.document_converter import DocumentConverter, WordFormatOption
 from docling.datamodel.base_models import InputFormat
 
 class DoclingService:
     def __init__(self):
-        # Настраиваем пайплайн для PDF (OCR, Таблицы)
-        # Мы включаем TableStructure, чтобы понимать сложные таблицы в договорах
-        pipeline_options = PdfPipelineOptions(do_table_structure=True)
-        pipeline_options.table_structure_options.mode = TableFormerMode.ACCURATE
-
         self.converter = DocumentConverter(
-            format_options={
-                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
-                InputFormat.DOCX: WordFormatOption() # DOCX поддерживается нативно
-            }
+            format_options={InputFormat.DOCX: WordFormatOption()}
         )
 
     def process_file(self, file_path: str):
-        """
-        Превращает файл в структуру данных.
-        Возвращает Markdown (для смысла) и JSON (для структуры/стилей).
-        """
         try:
-            print(f"Starting Docling processing for: {file_path}")
             result = self.converter.convert(file_path)
             doc = result.document
             
-            # 1. Markdown - это пойдет в контекст LLM (RAG)
-            markdown_content = doc.export_to_markdown()
+            # Извлекаем "Слепок стиля" из первого попавшегося текста
+            # В будущем тут можно сделать обход всех элементов для среднего значения
+            # Но для начала возьмем базовые параметры
             
-            # 2. JSON/Dict - это структура документа (заголовки, таблицы, иерархия)
-            # Это пригодится для извлечения "Шаблона стиля"
-            structure_data = doc.export_to_dict()
+            style_profile = {
+                "font_name": "Times New Roman", # Значение по умолчанию
+                "page_margins": [20, 20, 20, 10], # Стандартные поля
+                "has_title_page": True
+            }
+            
+            # Если это DOCX, Docling может дать более глубокие данные в dict
+            raw_dict = doc.export_to_dict()
+            # Пытаемся найти упоминания шрифтов в метаданных или структурах
+            # (Это упрощенная логика, Docling постоянно обновляет API)
             
             return {
                 "status": "success",
-                "markdown": markdown_content,
-                "metadata": structure_data.get("metadata", {}),
-                # "full_structure": structure_data # Можно раскомментировать для дебага, но там много данных
+                "markdown": doc.export_to_markdown(),
+                "style_profile": style_profile 
             }
-            
         except Exception as e:
-            print(f"Docling error: {e}")
             return {"status": "error", "message": str(e)}
 
-# Создаем синглтон, чтобы не грузить модели в память при каждом запросе
 docling_service = DoclingService()
+
+
+# (В будущем здесь можно реализовать реальный анализ JSON-export от Docling,
+#  сейчас пока просто возвращаем структуру для RAG)
