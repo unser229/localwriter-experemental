@@ -9,10 +9,21 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 SOURCE_DIR="$PROJECT_ROOT/extension"
 BUILD_DIR="$PROJECT_ROOT/build"
 LO_PATH="/usr/lib/libreoffice/program"
+# Путь к lock-файлу (обычно здесь в Linux)
+LOCK_FILE="$HOME/.config/libreoffice/4/.lock"
 
 echo "📂 Project Root: $PROJECT_ROOT"
 echo "🛑 Закрываем LibreOffice..."
 killall -9 soffice.bin soffice 2>/dev/null
+# Даем секунду системе на освобождение ресурсов
+sleep 1
+
+# --- FIX: УДАЛЕНИЕ LOCK ФАЙЛА ---
+if [ -f "$LOCK_FILE" ]; then
+    echo "🔓 Удаляем зависший lock-файл..."
+    rm -f "$LOCK_FILE"
+fi
+# --------------------------------
 
 echo "📦 Собираем новый пакет..."
 mkdir -p "$BUILD_DIR"
@@ -24,6 +35,7 @@ cd "$SOURCE_DIR" || exit
 zip -r -q "$BUILD_DIR/$EXT_FILE" *
 
 echo "🧹 Удаляем старую версию..."
+# unopkg тоже может ругаться на lock, поэтому удаляем его до unopkg
 $LO_PATH/unopkg remove $EXT_ID --force >/dev/null 2>&1
 
 echo "🚀 Устанавливаем расширение..."
@@ -34,11 +46,17 @@ if [ $? -eq 0 ]; then
     nohup soffice --writer >/dev/null 2>&1 &
 else
     echo "❌ ОШИБКА УСТАНОВКИ!"
+    # Если ошибка, попробуем вывести, что сказал unopkg (убрав перенаправление в null выше для отладки, если понадобится)
 fi
 
 echo "📄 Открываем лог файл..."
 if [ -f /tmp/localwriter.log ]; then
-    code /tmp/localwriter.log
+    # Если code не установлен, можно заменить на xdg-open или cat
+    if command -v code &> /dev/null; then
+        code /tmp/localwriter.log
+    else
+        cat /tmp/localwriter.log
+    fi
 else
     echo "Лог-файл еще не создан."
 fi
