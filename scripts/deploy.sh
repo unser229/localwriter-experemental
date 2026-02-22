@@ -12,6 +12,15 @@ LO_PATH="/usr/lib/libreoffice/program"
 # Путь к lock-файлу (обычно здесь в Linux)
 LOCK_FILE="$HOME/.config/libreoffice/4/.lock"
 
+# FIX: Запуск unopkg изнутри активированного Python virtualenv вызывает std::bad_alloc
+# Поэтому очищаем переменные окружения, связанные с Python, перед запуском инструментов LibreOffice
+unset VIRTUAL_ENV
+unset PYTHONHOME
+unset PYTHONPATH
+
+# Важно также убрать виртуальное окружение из PATH, иначе LibreOffice всё равно найдет python из poetry
+export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v "/\.cache/pypoetry/virtualenvs/" | paste -sd ':' -)
+
 echo "📂 Project Root: $PROJECT_ROOT"
 echo "🛑 Закрываем LibreOffice..."
 killall -9 soffice.bin soffice 2>/dev/null
@@ -39,7 +48,7 @@ echo "🧹 Удаляем старую версию..."
 $LO_PATH/unopkg remove $EXT_ID --force >/dev/null 2>&1
 
 echo "🚀 Устанавливаем расширение..."
-$LO_PATH/unopkg add --force "$BUILD_DIR/$EXT_FILE"
+$LO_PATH/unopkg add --force --suppress-license "$BUILD_DIR/$EXT_FILE"
 
 if [ $? -eq 0 ]; then
     echo "✅ УСПЕШНО! Запускаем Writer..."

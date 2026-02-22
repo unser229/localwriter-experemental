@@ -37,6 +37,77 @@ TEMP_DIR = os.path.join(os.getcwd(), "data", "temp")
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 # ... (функции construct_prompt те же) ...
+# Системный промпт для Ollama — жёсткое ограничение на JSON-only вывод
+SYSTEM_PROMPT_JSON = (
+    "You are a JSON-only API. You MUST respond with a valid JSON array. "
+    "Never include explanations, reasoning, thinking, or commentary. "
+    "Start your response with '[' and end with ']'. "
+    "Do NOT use markdown code blocks."
+)
+
+
+def _normalize_to_list(parsed):
+    """Нормализует JSON к списку: dict -> [dict], list -> list."""
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        # Модель вернула один объект — оборачиваем в список
+        return [parsed]
+    return None
+
+
+def extract_json_from_llm_response(raw_text: str):
+    """Извлекает JSON из сырого ответа LLM, даже если модель нагенерила мусор вокруг."""
+    if not raw_text:
+        return None
+
+    # 1. Попробовать напрямую
+    try:
+        parsed = json.loads(raw_text)
+        result = _normalize_to_list(parsed)
+        if result is not None:
+            return result
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # 2. Найти JSON массив в тексте (жадный поиск от первого [ до последнего ])
+    start = raw_text.find('[')
+    end = raw_text.rfind(']')
+    if start != -1 and end != -1 and end > start:
+        try:
+            parsed = json.loads(raw_text[start:end + 1])
+            result = _normalize_to_list(parsed)
+            if result is not None:
+                return result
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # 3. Найти JSON объект в тексте (от первого { до последнего })
+    start = raw_text.find('{')
+    end = raw_text.rfind('}')
+    if start != -1 and end != -1 and end > start:
+        try:
+            parsed = json.loads(raw_text[start:end + 1])
+            result = _normalize_to_list(parsed)
+            if result is not None:
+                return result
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # 4. Найти JSON в markdown блоке
+    match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', raw_text)
+    if match:
+        try:
+            parsed = json.loads(match.group(1))
+            result = _normalize_to_list(parsed)
+            if result is not None:
+                return result
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    return None
+
+
 def construct_deep_style_prompt(context_snippets: str) -> str:
     return (
         "You are a Document Layout Engine (Deep Style v2).\n"
@@ -51,20 +122,11 @@ def construct_deep_style_prompt(context_snippets: str) -> str:
         "- [A: CENTER]: Alignment.\n\n"
         "### TASK\n"
         "Map the USER CONTENT to the visual structure of the REFERENCE.\n"
-        "- Use styles from Reference.\n"
-        "- Return ONLY a valid JSON list.\n\n"
+        "CRITICAL: Output ONLY a raw JSON array. No markdown, no explanations, no thinking.\n"
+        "Start your response with '[' and end with ']'.\n\n"
         "### OUTPUT FORMAT (JSON ONLY)\n"
-        "[\n"
-        "  {\n"
-        "    \"type\": \"header\" | \"paragraph\" | \"table\",\n"
-        "    \"text\": \"...\",\n"
-        "    \"style_name\": \"...\",\n"
-        "    \"font_family\": \"...\",\n"
-        "    \"font_size\": 12.0,\n"
-        "    \"bold\": true,\n"
-        "    \"align\": \"left\"\n"
-        "  }\n"
-        "]\n"
+        "[{\"type\": \"header\", \"text\": \"...\", \"style_name\": \"...\", "
+        "\"font_family\": \"...\", \"font_size\": 12.0, \"bold\": true, \"align\": \"left\"}]\n"
     )
 
 def construct_generic_prompt() -> str:
@@ -104,7 +166,9 @@ async def proxy_completions(
 
     clean_query = re.sub(r'[^\w\sа-яА-Яa-zA-Z0-9]', ' ', search_query).strip()
 
-    final_prompt = raw_prompt # Fallback
+    # Формируем messages для /api/chat (разделение system/user ролей)
+    system_message = SYSTEM_PROMPT_JSON
+    user_message = search_query  # Fallback
 
     if len(clean_query) > 5:
         print(f"🔎 Deep Style Search: '{clean_query[:50]}...'")
@@ -114,25 +178,32 @@ async def proxy_completions(
             found_context = style_data["full_context"]
             best_template_uuid = style_data["source_id"]
             print(f"✅ RAG: Found Template -> {best_template_uuid}")
-            system_instruction = construct_deep_style_prompt(found_context)
-            final_prompt = (
-                f"{system_instruction}\n\n"
-                f"=== REFERENCE DATA ===\n{found_context}\n\n"
-                f"=== USER CONTENT ===\n{search_query}\n\n"
+            # Системная инструкция = промпт + REFERENCE
+            system_message = (
+                f"{construct_deep_style_prompt(found_context)}\n\n"
+                f"=== REFERENCE DATA ===\n{found_context}"
             )
+            # Пользовательское сообщение = только контент
+            user_message = search_query
         else:
             print("🔸 RAG: No style reference found.")
-            final_prompt = (
-                f"{construct_generic_prompt()}\n\n"
-                f"=== USER CONTENT ===\n{search_query}\n\n"
-            )
-        data['prompt'] = final_prompt
+            system_message = construct_generic_prompt()
+            user_message = search_query
             
-    # SETTINGS
-    data['format'] = 'json'
-    if 'options' not in data: data['options'] = {}
-    data['options']['num_ctx'] = settings.OLLAMA_CTX 
-    data['options']['temperature'] = 0.2
+    # Формируем payload для /api/chat
+    chat_payload = {
+        'model': data.get('model', ''),
+        'messages': [
+            {'role': 'system', 'content': system_message},
+            {'role': 'user', 'content': user_message}
+        ],
+        'format': 'json',
+        'stream': False,
+        'options': {
+            'num_ctx': settings.OLLAMA_CTX,
+            'temperature': 0.1
+        }
+    }
 
     response_headers = {}
     if best_template_uuid:
@@ -140,7 +211,7 @@ async def proxy_completions(
         response_headers["X-Best-Template-ID"] = safe_header_value
 
     clean_url = x_target_ollama_url.rstrip('/')
-    target_endpoint = f"{clean_url}/v1/completions"
+    target_endpoint = f"{clean_url}/api/chat"
     print(f"Proxying request to -> {target_endpoint}")
 
     # --- BLOCKING REQUEST (Apply Template) ---
@@ -148,15 +219,33 @@ async def proxy_completions(
         async with httpx.AsyncClient() as client:
             try:
                 # ДИНАМИЧЕСКИЙ ТАЙМАУТ
-                # Считаем длину полного промпта (Инструкция + RAG + Текст юзера)
-                full_prompt_len = len(final_prompt)
+                full_prompt_len = len(system_message) + len(user_message)
                 dynamic_timeout = settings.estimate_timeout(full_prompt_len)
                 
                 print(f"⏳ Dynamic Timeout: {dynamic_timeout:.1f}s (Prompt: {full_prompt_len} chars, TPS: {settings.current_tps:.1f})")
                 
-                resp = await client.post(target_endpoint, json=data, timeout=dynamic_timeout)
+                resp = await client.post(target_endpoint, json=chat_payload, timeout=dynamic_timeout)
                 resp.raise_for_status()
-                return JSONResponse(content=resp.json(), headers=response_headers)
+                ollama_response = resp.json()
+                
+                # /api/chat возвращает ответ в message.content, а не в response
+                raw_llm_text = ""
+                if "message" in ollama_response:
+                    raw_llm_text = ollama_response["message"].get("content", "")
+                elif "response" in ollama_response:
+                    raw_llm_text = ollama_response.get("response", "")
+                
+                parsed_json = extract_json_from_llm_response(raw_llm_text)
+                
+                if parsed_json is not None:
+                    # Приводим ответ к формату, который ожидает клиент (поле "response")
+                    ollama_response["response"] = json.dumps(parsed_json, ensure_ascii=False)
+                    print(f"✅ JSON extracted successfully ({len(parsed_json)} elements)")
+                else:
+                    print(f"⚠️ JSON EXTRACTION FAILED. Raw (first 500 chars): {raw_llm_text[:500]}")
+                    # Оставляем сырой ответ — клиент попробует сам
+                
+                return JSONResponse(content=ollama_response, headers=response_headers)
             except Exception as e:
                 # ВАЖНО: Выводим реальную ошибку в консоль
                 print(f"❌ Ollama Error: {type(e).__name__}: {e}")

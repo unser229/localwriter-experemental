@@ -1,12 +1,16 @@
+import os
 import time
 import httpx
 from app.config import settings
 
-async def calibrate_ollama(ollama_url: str = "http://localhost:11434", model: str = ""):
+async def calibrate_ollama(ollama_url: str | None = None, model: str = ""):
     """
     Отправляет короткий запрос, чтобы прогреть модель и замерить скорость.
     """
-    print("⏳ Calibrating Inference Speed...")
+    if ollama_url is None:
+        ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
+
+    print(f"⏳ Calibrating Inference Speed using {ollama_url}...")
     
     # 1. Если модель не задана, пытаемся узнать список тегов, берем первый попавшийся
     # (В реальном проекте лучше брать ту, что в конфиге, но здесь упростим)
