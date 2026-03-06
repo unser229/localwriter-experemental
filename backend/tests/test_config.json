@@ -1,0 +1,11 @@
+{
+    "server_url": "http://localhost:8323",
+    "ollama_url": "http://192.168.0.110:11434",
+    "excluded_models": [
+        "translategemma:12b",
+        "translategemma:latest"
+    ],
+    "batch_size_paragraphs": 8,
+    "max_chars_per_batch": 1500,
+    "semantic_mode": true
+}

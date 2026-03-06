@@ -4,25 +4,33 @@ import uno
 import unohelper
 import officehelper
 import json
-import urllib.request
-import urllib.error
-import urllib.parse
 import traceback
 import datetime
-import re
-
-# === ИМПОРТЫ ===
-try:
-    sys.path.append(os.path.dirname(__file__))
-    from uno_formatter import UnoFormatter
-    from tracer import ExecutionTracer
-except ImportError as e:
-    pass
+import threading
+import queue
+import time
+import urllib.parse
 
 from com.sun.star.task import XJobExecutor
-from com.sun.star.awt import XActionListener
+from com.sun.star.awt import XActionListener, XWindowListener
+from com.sun.star.lang import EventObject
 
-# === LOGGING HELPER ===
+# XTimeoutListener нужно извлекать динамически, прямой импорт часто падает в UNO
+try:
+    XTimeoutListener = uno.getClass("com.sun.star.awt.XTimeoutListener")
+except:
+    XTimeoutListener = None
+
+# === ИМПОРТЫ ===
+# LibreOffice Python loader does not always add the extension folder to sys.path
+_cur_dir = os.path.dirname(os.path.abspath(__file__))
+if _cur_dir not in sys.path:
+    sys.path.insert(0, _cur_dir)
+
+import client as lw_client
+from uno_formatter import UnoFormatter
+from tracer import ExecutionTracer
+
 def log_to_file(message, error=None):
     log_file_path = "/tmp/localwriter.log"
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
@@ -33,37 +41,6 @@ def log_to_file(message, error=None):
         with open(log_file_path, "a", encoding="utf-8") as f: f.write(log_entry + "\n")
     except: pass
 
-# === JSON PARSER HELPER ===
-def extract_json_from_text(text):
-    if not text: return None
-    text = text.replace("&nbsp;", " ").replace("&quot;", '"')
-    
-    match = re.search(r'```json\s*([\s\S]*?)\s*```', text)
-    if match:
-        try: return json.loads(match.group(1).strip())
-        except: pass
-
-    match = re.search(r'```\s*([\s\S]*?)\s*```', text)
-    if match:
-        try: return json.loads(match.group(1).strip())
-        except: pass
-        
-    match = re.search(r'^\s*\[[\s\S]*\]\s*$', text)
-    if match:
-        try: return json.loads(match.group(0))
-        except: pass
-        
-    try: return json.loads(text)
-    except: pass
-    
-    try:
-        start = text.find('[')
-        end = text.rfind(']') + 1
-        if start != -1 and end != -1:
-            return json.loads(text[start:end])
-    except: pass
-
-    return None
 
 # === SETTINGS UI ===
 class SettingsDialogHandler(unohelper.Base, XActionListener):
@@ -83,22 +60,19 @@ class SettingsDialogHandler(unohelper.Base, XActionListener):
         model.PositionX = 100
         model.PositionY = 100
         model.Width = 260
-        model.Height = 220 
+        model.Height = 170
         
         self._add_label("lbl_mid", "Middleware URL (Backend):", 10, 10, 240, 10)
         self._add_edit("txt_mid", self.config.get("middleware_url", "http://localhost:8323"), 10, 22, 240, 15)
         
-        self._add_label("lbl_ollama", "Inference Engine URL (Ollama):", 10, 45, 240, 10)
-        self._add_edit("txt_ollama", self.config.get("ollama_url", "http://localhost:11434"), 10, 57, 240, 15)
-        
-        self._add_button("btn_check", "🔄 Check Connection & Fetch Models", 10, 80, 240, 20, "CheckConn")
+        self._add_button("btn_check", "🔄 Check Connection & Fetch Models", 10, 47, 240, 20, "CheckConn")
 
-        self._add_label("lbl_model", "Select Model:", 10, 110, 240, 10)
+        self._add_label("lbl_model", "Select Model:", 10, 77, 240, 10)
         current_model = self.config.get("model", "")
-        self._add_combo("cb_model", current_model, 10, 122, 240, 15)
+        self._add_combo("cb_model", current_model, 10, 89, 240, 15)
 
-        self._add_button("btn_ok", "Save Settings", 90, 190, 70, 20, "OK", True)
-        self._add_button("btn_cancel", "Cancel", 170, 190, 50, 20, "Cancel")
+        self._add_button("btn_ok", "Save Settings", 90, 140, 70, 20, "OK", True)
+        self._add_button("btn_cancel", "Cancel", 170, 140, 50, 20, "Cancel")
         
         toolkit = smgr.createInstanceWithContext("com.sun.star.awt.Toolkit", self.ctx)
         self.dialog.createPeer(toolkit, None)
@@ -145,35 +119,20 @@ class SettingsDialogHandler(unohelper.Base, XActionListener):
         if cmd == "CheckConn":
             try:
                 mid_url = self.dialog.getControl("txt_mid").getText().rstrip('/')
-                oll_url = self.dialog.getControl("txt_ollama").getText().rstrip('/')
-                
-                target = f"{mid_url}/api/tags"
-                # Добавляем user-agent на всякий случай
-                headers = {
-                    "X-Target-Ollama-Url": oll_url,
-                    "User-Agent": "LocalWriter-Client"
-                }
-                req = urllib.request.Request(target, headers=headers)
-                
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    data = json.loads(resp.read().decode())
-                    
-                models = []
-                if "models" in data:
-                    models = [m.get("name") for m in data["models"]]
-                
+
+                # HTTP-вызов через client.py
+                models = lw_client.check_connection(mid_url, timeout=5)
+
                 if models:
                     cb = self.dialog.getControl("cb_model")
                     cb.getModel().StringItemList = tuple(models)
-                    
                     curr = cb.getText()
                     if curr not in models:
                         cb.setText(models[0])
-                    
                     self._msg_box(f"✅ Connection Successful!\nLoaded {len(models)} models.", "Success")
                 else:
                     self._msg_box("⚠️ Connection OK, but no models found.", "Warning")
-                    
+
             except Exception as ex:
                 log_to_file("Check Connection Failed", ex)
                 # Показываем ошибку пользователю
@@ -182,7 +141,6 @@ class SettingsDialogHandler(unohelper.Base, XActionListener):
         elif cmd == "OK":
             self.result = {
                 "middleware_url": self.dialog.getControl("txt_mid").getText(),
-                "ollama_url": self.dialog.getControl("txt_ollama").getText(),
                 "model": self.dialog.getControl("cb_model").getText()
             }
             self.dialog.endExecute()
@@ -192,6 +150,235 @@ class SettingsDialogHandler(unohelper.Base, XActionListener):
             self.dialog.endExecute()
 
     def disposing(self, e): pass
+
+# === PROGRESS DIALOG ===
+class ProgressDialogHandler(unohelper.Base, XActionListener):
+    def __init__(self, ctx, cancel_event):
+        self.ctx = ctx
+        self.cancel_event = cancel_event
+        self.dialog = None
+        self.toolkit = None
+    
+    def create(self):
+        smgr = self.ctx.getServiceManager()
+        self.dialog = smgr.createInstanceWithContext("com.sun.star.awt.UnoControlDialog", self.ctx)
+        model = smgr.createInstanceWithContext("com.sun.star.awt.UnoControlDialogModel", self.ctx)
+        self.dialog.setModel(model)
+        
+        model.Title = "AI Formatting in Progress..."
+        model.PositionX = 100
+        model.PositionY = 100
+        model.Width = 200
+        model.Height = 80
+        
+        # Label
+        lbl = model.createInstance("com.sun.star.awt.UnoControlFixedTextModel")
+        lbl.Name = "lblStatus"
+        lbl.Label = "Generating formatting... Please wait.\nDo not edit document manually."
+        lbl.PositionX = 10; lbl.PositionY = 15; lbl.Width = 180; lbl.Height = 20
+        model.insertByName("lblStatus", lbl)
+        
+        # Button Cancel
+        btn = model.createInstance("com.sun.star.awt.UnoControlButtonModel")
+        btn.Name = "btnCancel"
+        btn.Label = "Cancel"
+        btn.PositionX = 65; btn.PositionY = 45; btn.Width = 70; btn.Height = 20
+        model.insertByName("btnCancel", btn)
+        self.dialog.getControl("btnCancel").setActionCommand("Cancel")
+        self.dialog.getControl("btnCancel").addActionListener(self)
+        
+        self.toolkit = smgr.createInstanceWithContext("com.sun.star.awt.Toolkit", self.ctx)
+        self.dialog.createPeer(self.toolkit, None)
+        return self.dialog
+        
+    def update_status(self, text):
+        if self.dialog:
+            try:
+                self.dialog.getControl("lblStatus").setText(text)
+            except: pass
+
+    def actionPerformed(self, e):
+        if e.ActionCommand == "Cancel":
+            self.cancel_event.set()
+            self.update_status("Canceling... Waiting for backend to abort.")
+            
+    def disposing(self, e): pass
+
+
+# === TIMER LISTENER (POLLING QUEUE) ===
+# В UNO (LibreOffice Python) достаточно наследоваться от unohelper.Base 
+# и реализовать нужный метод timeout, явное наследование от XTimeoutListener вызывает metaclass conflict.
+class ApplyTemplateTimerListener(unohelper.Base):
+    def __init__(self, main_job, queue_obj, cancel_event, dialog_handler, bookmark_name, doc, formatter):
+        self.main_job = main_job
+        self.queue = queue_obj
+        self.cancel_event = cancel_event
+        self.dialog_handler = dialog_handler
+        self.bookmark_name = bookmark_name
+        self.doc = doc
+        self.formatter = formatter
+        self.chunk_count = 0
+        self.is_finished = False
+        
+        # Очищаем закладку при старте (первый чанк затирает выделение)
+        self.first_chunk_received = False
+        
+        # Включаем Undo Manager
+        try:
+            self.undo_manager = self.doc.getUndoManager()
+            self.undo_manager.enterUndoContext("AI Formatting")
+        except:
+            self.undo_manager = None
+        
+    def timeout(self, timer_event):
+        """Вызывается XTimer'ом каждый тик в UI-потоке LibreOffice"""
+        if self.is_finished:
+            return
+            
+        try:
+            # Читаем ВСЕ доступные сообщения в очереди (batch processing frame)
+            while not self.queue.empty():
+                item = self.queue.get_nowait()
+                
+                if "error" in item:
+                    self.main_job.msg_box(f"AI Error:\n{item['error']}", "Error")
+                    self._finish()
+                    return
+                    
+                if "DONE" in item:
+                    # Успех
+                    self._finish()
+                    return
+                
+                # Обработка готового параграфа JSON
+                self._process_chunk(item)
+                
+            # Позволяем GUI обновиться
+            if self.dialog_handler.toolkit:
+                self.dialog_handler.toolkit.processEventsToIdle()
+                
+        except queue.Empty:
+            pass
+        except Exception as e:
+            log_to_file("Timer polling error", e)
+            self.main_job.msg_box(f"Error applying style: {str(e)}", "Error")
+            self._finish()
+
+    def _process_chunk(self, block_data):
+        self.chunk_count += 1
+        self.dialog_handler.update_status(f"Applying AI styling...\nParagraphs processed: {self.chunk_count}")
+        
+        # Получаем закладку по ID параграфа из JSON
+        p_id = block_data.get("id")
+        if p_id is None:
+            log_to_file(f"Warning: No ID in block_data: {block_data}")
+            return
+            
+        target_bookmark = f"{self.bookmark_name}_p{p_id}"
+        
+        try:
+            bookmarks = self.doc.getBookmarks()
+            if not bookmarks.hasByName(target_bookmark):
+                log_to_file(f"Bookmark {target_bookmark} not found.")
+                return
+            bookmark = bookmarks.getByName(target_bookmark)
+            anchor = bookmark.getAnchor()
+        except Exception as e:
+            log_to_file(f"Bookmark retrieval error: {e}")
+            return
+
+        # Курсор на выделение всей закладки (абзаца), чтобы заменить его содержимым, если оно поменялось,
+        # или просто применить стиль.
+        text = self.doc.Text
+        cursor = text.createTextCursorByRange(anchor)
+        
+        # Используем formatter для вставки одного абзаца
+        # UNO_formatter.apply_structure_to_cursor_chunk(cursor, block_data)
+        # Так как старый uno_formatter очищал все, мы вызываем его логику вручную тут
+        # для одного блока.
+        try:
+            text_content = block_data.get("text", block_data.get("content", ""))
+            if text_content:
+                import re
+                text_content = re.sub(r'\*\*(.*?)\*\*', r'\1', text_content)
+                text_content = re.sub(r'^#+\s*', '', text_content)
+                
+            block_type = block_data.get("type", "paragraph")
+            if "level" in block_data and block_type == "paragraph": block_type = "header"
+            if "tableRows" in block_data: block_type = "table"; block_data["data"] = block_data["tableRows"]
+            
+            from com.sun.star.text.ControlCharacter import PARAGRAPH_BREAK
+            
+            if block_type == "table":
+                rows = block_data.get("rows", len(block_data.get("data", [])))
+                cols = block_data.get("cols", 1)
+                if cols == 1 and block_data.get("data") and len(block_data["data"]) > 0:
+                     cols = len(block_data["data"][0])
+                # Временно перехватчик insert_table (старый код полагался на self.cursor, а не переданный)
+                self.formatter.cursor = cursor
+                self.formatter.text = text
+                self.formatter.insert_table(rows, cols, block_data.get("data", []))
+                
+            elif block_type == "image":
+                self.formatter.insert_image_placeholder(cursor, text_content or "Image")
+                
+            elif block_type == "page_break":
+                cursor.BreakType = uno.getConstantByName("com.sun.star.style.BreakType.PAGE_BEFORE")
+                
+            elif block_type == "header":
+                level = block_data.get("level", 1)
+                style_name = block_data.get("style_name", f"Heading {level}")
+                self.formatter.ensure_style_exists(style_name, block_data)
+                try: cursor.ParaStyleName = style_name
+                except: pass
+                if text_content: text.insertString(cursor, text_content, False)
+                temp_cursor = text.createTextCursorByRange(cursor)
+                temp_cursor.goLeft(len(text_content), True)
+                self.formatter._apply_direct_formatting(temp_cursor, block_data)
+                text.insertControlCharacter(cursor, PARAGRAPH_BREAK, False)
+                
+            else:
+                if block_data.get("style_name"):
+                    self.formatter.ensure_style_exists(block_data["style_name"], block_data)
+                    try: cursor.ParaStyleName = block_data["style_name"]
+                    except: pass
+                if text_content:
+                    text.insertString(cursor, text_content, False)
+                    temp_cursor = text.createTextCursorByRange(cursor)
+                    temp_cursor.goLeft(len(text_content), True)
+                    self.formatter._apply_direct_formatting(temp_cursor, block_data)
+                text.insertControlCharacter(cursor, PARAGRAPH_BREAK, False)
+                
+            # Расширяем закладку, сдвигая ее конец за вставленный текст
+            # Закладка автоматом расширяется, если вставлять ВНУТРИ неё.
+        except Exception as e:
+            log_to_file("Chunk format error", e)
+
+    def _finish(self):
+        self.is_finished = True
+        
+        # Удаляем все созданные для батчинга закладки
+        try:
+            bookmarks = self.doc.getBookmarks()
+            # bookmarks не поддерживает итерацию напрямую удобным способом, берем имена:
+            bookmark_names = bookmarks.getElementNames()
+            for b_name in bookmark_names:
+                if b_name.startswith(self.bookmark_name):
+                    try:
+                        bookmarks.getByName(b_name).dispose()
+                    except:
+                        pass
+        except: pass
+        
+        # Закрываем Undo Context
+        if self.undo_manager:
+            try: self.undo_manager.leaveUndoContext()
+            except: pass
+            
+        # Закрываем диалог (это разблокирует execute() в основном потоке)
+        if self.dialog_handler and self.dialog_handler.dialog:
+            try: self.dialog_handler.dialog.endExecute()
+            except: pass
 
 # === MAIN EXECUTOR ===
 class MainJob(unohelper.Base, XJobExecutor):
@@ -226,7 +413,6 @@ class MainJob(unohelper.Base, XJobExecutor):
     def settings_box(self):
         cfg = {
             "middleware_url": self.get_config("middleware_url", "http://localhost:8323"),
-            "ollama_url": self.get_config("ollama_url", "http://localhost:11434"),
             "model": self.get_config("model", "")
         }
         return SettingsDialogHandler(self.ctx, cfg).show()
@@ -267,12 +453,9 @@ class MainJob(unohelper.Base, XJobExecutor):
             for k, v in res.items(): self.set_config(k, v)
             return
 
-        # Инициализация переменных
+        # Инициализация параметров (HTTP-вызовы делегированы в lw_client)
         middleware_url = self.get_config("middleware_url", "http://localhost:8323").rstrip('/')
-        ollama_url = self.get_config("ollama_url", "http://localhost:11434").rstrip('/')
         model_name = self.get_config("model", "")
-        headers = {'Content-Type': 'application/json', 'X-Target-Ollama-Url': ollama_url}
-        url = f"{middleware_url}/v1/completions"
 
         # Получение выделения
         try:
@@ -312,38 +495,117 @@ class MainJob(unohelper.Base, XJobExecutor):
             if not content:
                 self.msg_box("Document is empty or nothing selected.", "Info")
                 return
-            
-            clean_content = re.sub(r'[*#]', '', content)
-            payload_prompt = f"=== USER CONTENT (CONTENT SOURCE) ===\n{clean_content}"
-            
-            data = {
-                'model': model_name,
-                'prompt': payload_prompt,
-                'stream': False, # Backend теперь это уважает
-                'format': 'json', 
-                'options': {'num_ctx': 8192}
-            }
-            
+
             try:
-                # ВАЖНО: Увеличен таймаут для Apply Template, так как модель может долго думать
-                req = urllib.request.Request(url, data=json.dumps(data).encode(), headers=headers, method='POST')
+                # 1. Защита ввода: Расставляем закладки ПО АБЗАЦАМ
+                # Это критично для гибридного конвейера, так как ответы (ID) приходят не по порядку
+                bookmarks = model.getBookmarks()
+                base_bookmark_name = f"LW_AI_Target_{int(time.time())}"
                 
+                # Создаем курсор (enumeration) по параграфам выделенного текста
+                enum = text_range.createEnumeration()
+                p_id = 0
+                paragraphs_text = []
                 
-                with urllib.request.urlopen(req, timeout=300) as response:
-                    resp_data = json.loads(response.read().decode())
-                    ai_text = resp_data.get('response', '') or resp_data.get('choices', [{}])[0].get('text', '')
+                while enum.hasMoreElements():
+                    para = enum.nextElement()
+                    if para.supportsService("com.sun.star.text.Paragraph"):
+                        # Пропускаем пустые абзацы, чтобы не забивать контекст LLM мусором
+                        if not para.getString().strip():
+                            continue
+                            
+                        # Создаем индивидуальную закладку для абзаца
+                        b_name = f"{base_bookmark_name}_p{p_id}"
+                        bookmark = model.createInstance("com.sun.star.text.Bookmark")
+                        bookmark.Name = b_name
+                        
+                        # Вставляем закладку, охватывающую абзац
+                        para_cursor = text.createTextCursorByRange(para)
+                        model.Text.insertTextContent(para_cursor, bookmark, True)
+                        
+                        paragraphs_text.append(para.getString())
+                        p_id += 1
+                
+                if not paragraphs_text:
+                    self.msg_box("Document is empty or nothing selected.", "Info")
+                    return
+                
+                # 2. Очередь и контроль
+                result_queue = queue.Queue()
+                stop_event = threading.Event()
+                
+                # 3. Делаем стартовый быстрый UNO-согласованный UI
+                dlg_handler = ProgressDialogHandler(self.ctx, stop_event)
+                dialog = dlg_handler.create()
+                
+                # 4. Запускаем фоновый HTTP NDJSON поток
+                is_degraded, rag_id = lw_client.call_apply_template_ndjson(
+                    content=paragraphs_text,
+                    model=model_name,
+                    middleware_url=middleware_url,
+                    result_queue=result_queue,
+                    stop_event=stop_event,
+                )
+                
+                if is_degraded:
+                    # Всплывающее уведомление, что сервер работает в Degraded Mode
+                    self.msg_box((
+                        "⚠️ Server is low on RAM!\n\n"
+                        "LocalWriter is running in Degraded Mode (4096 tokens).\n"
+                        "Context memory is capped to prevent Out of Memory crash.\n\n"
+                        "The result might be slightly degraded."
+                    ), "Memory Warning")
+                
+                # 5. Timer Listener (Polling Queue in GUI Thread)
+                formatter = UnoFormatter(self.ctx)
+                timer_listener = ApplyTemplateTimerListener(
+                    self, result_queue, stop_event, dlg_handler, base_bookmark_name, model, formatter
+                )
+                
+                # Запускаем XTimer каждые 100 мс (10 FPS для UI-прогресса)
+                timer = self.ctx.getServiceManager().createInstanceWithContext("com.sun.star.awt.XTimer", self.ctx)
+                if not timer:
+                    timer = self.ctx.getServiceManager().createInstance("com.sun.star.awt.Timer")
                     
-                    structure = extract_json_from_text(ai_text)
+                if timer:
+                    timer.setInterval(100) # ms
+                    timer.addTimeoutListener(timer_listener)
+                    timer.start()
+                else:
+                    # Fallback для версий LibreOffice, где XTimer недоступен
+                    def poll_queue_fallback():
+                        while not timer_listener.is_finished:
+                            timer_listener.timeout(None)
+                            time.sleep(0.1)
+                    threading.Thread(target=poll_queue_fallback, daemon=True).start()
+                
+                # БЛОКИРУЕМ UI LibreOffice (модальный диалог), но оставляем GUI цикл живым 
+                # (XTimer будет дергать timer_listener.timeout, который будет менять док)
+                try:
+                    dialog.execute()
+                finally:
+                    # Гарантированная очистка (даже при отмене или ошибках сети)
+                    stop_event.set()
+                    if timer:
+                        try:
+                            timer.stop()
+                        except: pass
+                    try:
+                        dialog.dispose()
+                    except: pass
                     
-                    if structure and isinstance(structure, list):
-                        formatter = UnoFormatter(self.ctx)
-                        formatter.apply_structure(structure)
-                    else:
-                        log_to_file(f"JSON ERROR. Raw LLM Response:\n{ai_text}")
-                        self.msg_box("AI returned invalid data.\nCheck log: /tmp/localwriter.log", "Formatting Failed")
+                    # Принудительно вызываем очистку закладок и закрываем UndoContext
+                    try:
+                        timer_listener._finish()
+                    except: pass
+                
+                log_to_file(f"ApplyTemplate NDJSON Finished.")
+
             except Exception as e:
                 log_to_file("Network/Runtime Error", e)
-                self.msg_box(f"Connection Error: {e}", "Fail")
+                try: stop_event.set()
+                except: pass
+                self.msg_box(f"Application Error: {e}", "Fail")
             return
 
         # --- COMMANDS: STREAMING (Extend/Edit) ---
@@ -353,31 +615,20 @@ class MainJob(unohelper.Base, XJobExecutor):
             else:
                 user_input = self.input_box("Instruction:", "Edit")
                 full_prompt = f"ORIGINAL: {text_range.getString()}\nINSTR: {user_input}"
-            
-            data = {'model': model_name, 'prompt': full_prompt, 'stream': True}
-            
+
             try:
-                req = urllib.request.Request(url, data=json.dumps(data).encode(), headers=headers, method='POST')
                 toolkit = self.ctx.getServiceManager().createInstanceWithContext("com.sun.star.awt.Toolkit", self.ctx)
-                
                 is_first = True
-                with urllib.request.urlopen(req) as response:
-                    for line in response:
-                        if line.startswith(b"data: "):
-                            try:
-                                payload = line[6:].decode()
-                                if payload.strip() == "[DONE]": break
-                                chunk = json.loads(payload)
-                                delta = chunk.get("response", "") or chunk.get("choices", [{}])[0].get("text", "")
-                                if delta:
-                                    if args == "EditSelection" and is_first:
-                                        text_range.setString("")
-                                        is_first = False
-                                    text_range.setString(text_range.getString() + delta)
-                                    toolkit.processEventsToIdle()
-                            except: pass
+                # Получаем дельты через генератор из client.py
+                for delta in lw_client.call_streaming_completion(full_prompt, model_name, middleware_url):
+                    if args == "EditSelection" and is_first:
+                        text_range.setString("")
+                        is_first = False
+                    text_range.setString(text_range.getString() + delta)
+                    toolkit.processEventsToIdle()
             except Exception as e:
                 log_to_file("Stream Error", e)
+
 
 def main():
     try: ctx = XSCRIPTCONTEXT

@@ -4,15 +4,23 @@ import uuid
 import json
 import re
 import urllib.parse
-import httpx 
+import httpx
 from typing import List, Optional
 from fastapi import APIRouter, Request, Header, UploadFile, File
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from app.services.ollama_client import get_tags, stream_completion
 from app.services.rag_engine import rag_engine
+from app.services.llm_checker import get_safe_context, get_chars_per_token, SYSTEM_CPT
 from pydantic import BaseModel
 import subprocess
+import asyncio
 from app.config import settings
+from filelock import FileLock
+
+# Файловый мьютекс для /api/ingest: работает при uvicorn --workers N (несколько процессов).
+# asyncio.Lock() работает только внутри одного процесса — при нескольких воркерах не защищает.
+_INGEST_LOCK_PATH = os.path.join(os.getcwd(), "data", ".ingest.lock")
+os.makedirs(os.path.dirname(_INGEST_LOCK_PATH), exist_ok=True)
 
 router = APIRouter()
 
@@ -47,11 +55,21 @@ SYSTEM_PROMPT_JSON = (
 
 
 def _normalize_to_list(parsed):
-    """Нормализует JSON к списку: dict -> [dict], list -> list."""
+    """Нормализует JSON к списку: dict -> [dict], list -> list.
+    
+    Обрабатывает паттерны reasoning-моделей (deepseek-r1, qwen):
+    {"results": [...]} -> [...]
+    {"data": [...]}    -> [...]
+    Если в dict несколько ключей и хоть один — список объектов, берём его.
+    """
     if isinstance(parsed, list):
         return parsed
     if isinstance(parsed, dict):
-        # Модель вернула один объект — оборачиваем в список
+        # Паттерн: {"results": [...], ...} — берём первый список-значение
+        for v in parsed.values():
+            if isinstance(v, list) and len(v) > 0 and isinstance(v[0], dict):
+                return v
+        # Один объект без списка — оборачиваем
         return [parsed]
     return None
 
@@ -108,175 +126,310 @@ def extract_json_from_llm_response(raw_text: str):
     return None
 
 
-def construct_deep_style_prompt(context_snippets: str) -> str:
-    return (
-        "You are a Document Layout Engine (Deep Style v2).\n"
-        "Your goal involves two inputs:\n"
-        "1. REFERENCE (Style Source): Fragments of a document with technical tags.\n"
-        "2. USER CONTENT: Raw text that needs formatting.\n\n"
-        "### UNDERSTANDING THE TAGS\n"
-        "- [S: Name]: The Style Name.\n"
-        "- [F: Name]: Font Family.\n"
-        "- [P: 12.0]: Font Size.\n"
-        "- [B: True]: Bold.\n"
-        "- [A: CENTER]: Alignment.\n\n"
-        "### TASK\n"
-        "Map the USER CONTENT to the visual structure of the REFERENCE.\n"
-        "CRITICAL: Output ONLY a raw JSON array. No markdown, no explanations, no thinking.\n"
-        "Start your response with '[' and end with ']'.\n\n"
-        "### OUTPUT FORMAT (JSON ONLY)\n"
-        "[{\"type\": \"header\", \"text\": \"...\", \"style_name\": \"...\", "
-        "\"font_family\": \"...\", \"font_size\": 12.0, \"bold\": true, \"align\": \"left\"}]\n"
-    )
+def _find_style_by_keyword(style_map: dict, keywords: list[str]) -> Optional[str]:
+    """Ищет первый стиль из style_map, чьё имя содержит одно из keywords."""
+    if not style_map: return None
+    for s_name in style_map.keys():
+        s_lower = s_name.lower()
+        if any(kw.lower() in s_lower for kw in keywords):
+            return s_name
+    return None
 
-def construct_generic_prompt() -> str:
-    return (
-        "You are a formatting assistant. Convert the user text into a JSON structure.\n"
-        "Return ONLY valid JSON."
-    )
+def apply_heuristics(paragraphs: list[dict], style_map: dict) -> dict[int, str]:
+    """
+    Шаг A: Применяет простые правила (эвристики) для назначения стилей.
+    Ищет динамические стили из RAG (без хардкода).
+    Возвращает {id: style_name}.
+    """
+    results = {}
+    
+    # Ищем подходящие стили из документа
+    heading_style = _find_style_by_keyword(style_map, ["heading", "заголовок", "title", "глава"])
+    list_num_style = _find_style_by_keyword(style_map, ["list number", "список", "нумеров"])
+    list_bul_style = _find_style_by_keyword(style_map, ["list bullet", "маркиров", "bullet"])
+    
+    for p in paragraphs:
+        pid = p.get("id")
+        text = str(p.get("text", "")).strip()
+        if not text or pid is None:
+            continue
+            
+        # 1. Заголовок (Короткий + ALL CAPS)
+        if heading_style and len(text) <= 80 and text.isupper():
+            results[pid] = heading_style
+            print(f"  🧠 Heuristic: Заголовок -> [ID: {pid}]")
+            continue
+            
+        # 2. Нумерованный список
+        if list_num_style and re.match(r'^\d+[\.\)]\s+', text):
+            results[pid] = list_num_style
+            print(f"  🧠 Heuristic: Список (Num) -> [ID: {pid}]")
+            continue
+            
+        # 3. Маркированный список
+        if list_bul_style and re.match(r'^[-•\*]\s+', text):
+            results[pid] = list_bul_style
+            print(f"  🧠 Heuristic: Список (Bul) -> [ID: {pid}]")
+            continue
+            
+    return results
+
 
 @router.get("/api/tags")
-async def proxy_tags(x_target_ollama_url: str = Header(None, alias="X-Target-Ollama-Url")):
-    if not x_target_ollama_url: x_target_ollama_url = "http://localhost:11434"
-    data = await get_tags(x_target_ollama_url)
-    return JSONResponse(content=data)
+async def proxy_tags():
+    """Проксирует запрос к Ollama /api/tags для проверки соединения и получения списка моделей клиентом."""
+    ollama_url = settings.OLLAMA_BASE_URL.rstrip('/')
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(f"{ollama_url}/api/tags", timeout=5.0)
+            resp.raise_for_status()
+            return JSONResponse(resp.json())
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
 
 @router.post("/v1/completions")
-async def proxy_completions(
-    request: Request, 
-    x_target_ollama_url: str = Header(None, alias="X-Target-Ollama-Url")
-):
-    if not x_target_ollama_url: x_target_ollama_url = "http://localhost:11434"
-    
+async def proxy_completions(request: Request):
+    """
+    Гибридный конвейер: Client Batching + Heuristics + Vector Fast Track + LLM.
+    Принимает prompt в формате JSON-массива параграфов: [{"id": 1, "text": "..."}]
+    """
+    ollama_url = settings.OLLAMA_BASE_URL
     data = await request.json()
     raw_prompt = data.get('prompt', '')
-    best_template_uuid = None
+    model_name = data.get('model', '')
     
-    # --- RAG LOGIC ---
+    # 0. Извлекаем массив параграфов из промпта
+    paragraphs = []
     marker = "=== USER CONTENT (CONTENT SOURCE) ==="
     if marker in raw_prompt:
-        search_query = raw_prompt.split(marker)[-1]
-    else:
-        search_query = raw_prompt
+        json_content = raw_prompt.split(marker)[-1].strip()
+        try:
+            # Клиент отправляет JSON: [{"id": N, "text": "..."}]
+            paragraphs = json.loads(json_content)
+        except json.JSONDecodeError:
+            pass
+            
+    if not isinstance(paragraphs, list):
+        print("⚠️ Warning: proxy_completions did not receive a JSON array of paragraphs.")
+        paragraphs = []
 
-    # ОПТИМИЗАЦИЯ: Обрезка
-    if len(search_query) > settings.MAX_INPUT_CHARS:
-        print(f"✂️ Truncating input from {len(search_query)} to {settings.MAX_INPUT_CHARS} chars (Limit Policy)")
-        search_query = search_query[:settings.MAX_INPUT_CHARS] + "... [TRUNCATED]"
-
+    # --- RAG SEARCH (по первому абзацу батча, чтобы найти шаблон документа) ---
+    search_query = paragraphs[0]["text"] if paragraphs else raw_prompt
     clean_query = re.sub(r'[^\w\sа-яА-Яa-zA-Z0-9]', ' ', search_query).strip()
 
-    # Формируем messages для /api/chat (разделение system/user ролей)
-    system_message = SYSTEM_PROMPT_JSON
-    user_message = search_query  # Fallback
-
+    style_map = {}
+    best_template_uuid = None
+    system_message = ""
+    
     if len(clean_query) > 5:
-        print(f"🔎 Deep Style Search: '{clean_query[:50]}...'")
         style_data = rag_engine.search_style_reference(clean_query)
-        
         if style_data:
-            found_context = style_data["full_context"]
             best_template_uuid = style_data["source_id"]
-            print(f"✅ RAG: Found Template -> {best_template_uuid}")
-            # Системная инструкция = промпт + REFERENCE
-            system_message = (
-                f"{construct_deep_style_prompt(found_context)}\n\n"
-                f"=== REFERENCE DATA ===\n{found_context}"
-            )
-            # Пользовательское сообщение = только контент
-            user_message = search_query
-        else:
-            print("🔸 RAG: No style reference found.")
-            system_message = construct_generic_prompt()
-            user_message = search_query
+            style_map = style_data.get("style_map", {})
+            print(f"✅ RAG Template -> {best_template_uuid} (Styles: {len(style_map)})")
             
-    # Формируем payload для /api/chat
-    chat_payload = {
-        'model': data.get('model', ''),
-        'messages': [
-            {'role': 'system', 'content': system_message},
-            {'role': 'user', 'content': user_message}
-        ],
-        'format': 'json',
-        'stream': False,
-        'options': {
-            'num_ctx': settings.OLLAMA_CTX,
-            'temperature': 0.1
-        }
-    }
+            # Подготовка жесткого system-промпта
+            available_styles = list(style_map.keys())
+            styles_json = json.dumps(available_styles, ensure_ascii=False)
+            system_message = (
+                "YOU ARE A JSON-ONLY STYLE CLASSIFIER.\n"
+                "DO NOT SUMMARIZE. DO NOT ADD TEXT. DO NOT REASON.\n"
+                f"Available exact style names: {styles_json}\n\n"
+                "Return exactly ONE JSON dict mapping 'id' to 'style_name', like this:\n"
+                "{\n  \"1\": \"Normal\",\n  \"2\": \"Heading 1\"\n}\n"
+            )
 
     response_headers = {}
     if best_template_uuid:
-        safe_header_value = urllib.parse.quote(best_template_uuid)
-        response_headers["X-Best-Template-ID"] = safe_header_value
+        response_headers["X-Best-Template-ID"] = urllib.parse.quote(best_template_uuid)
 
-    clean_url = x_target_ollama_url.rstrip('/')
-    target_endpoint = f"{clean_url}/api/chat"
-    print(f"Proxying request to -> {target_endpoint}")
+    safe_context_budget, is_degraded = await get_safe_context(model_name, ollama_url)
+    if is_degraded: response_headers["X-Degraded-Mode"] = "true"
 
-    # --- BLOCKING REQUEST (Apply Template) ---
-    if not data.get('stream'):
+    # =========================================================================
+    # THE HYBRID PIPELINE
+    # =========================================================================
+    final_merged_results: dict[int, str] = {}
+    
+    # Шаг A: Эвристики
+    if paragraphs and style_map:
+        heuristic_hits = apply_heuristics(paragraphs, style_map)
+        final_merged_results.update(heuristic_hits)
+    
+    # Фильтруем оставшиеся для Шага B
+    remaining_for_vector = [p for p in paragraphs if p["id"] not in final_merged_results]
+    
+    # Шаг B: Vector Fast Track (Batch)
+    if remaining_for_vector and style_map:
+        texts_to_search = [p["text"] for p in remaining_for_vector]
+        # Дистанция 0.20 — очень высокая уверенность
+        vector_hits = rag_engine.search_batch_fast_track(texts_to_search, fast_track_distance=0.20)
+        
+        for batch_idx, style_name in vector_hits.items():
+            original_p = remaining_for_vector[batch_idx]
+            # Проверять наличие стиля в style_map для стабильности? (опционально)
+            final_merged_results[original_p["id"]] = style_name
+            
+    # Фильтруем оставшиеся для Шага C (LLM)
+    remaining_for_llm = [p for p in paragraphs if p["id"] not in final_merged_results]
+    
+    # =========================================================================
+    # THE MERGE & STREAM
+    # =========================================================================
+    async def streaming_generator():
+        success_count = 0
+        import time
+        last_heartbeat = time.time()
+        
+        # 1. Стримим готовые результаты из A (Heuristics) и B (Vector)
+        for pid, style in final_merged_results.items():
+            yield f"{json.dumps({'id': pid, 'style_name': style}, ensure_ascii=False)}\n"
+            success_count += 1
+            
+        # 2. Если все обработано — завершаем поток
+        if not remaining_for_llm:
+            print(f"⚡ Batch completely resolved by FastTrack (A+B)! Yielded {success_count} items.")
+            yield "\n"
+            return
+            
+        # 3. Шаг C: Идем в LLM только с самыми сложными параграфами
+        print(f"🤖 Calling LLM for {len(remaining_for_llm)} objects...")
+        
+        # Формируем промпт из параграфов формата [ID] Text
+        llm_prompt = "\n".join([f"[{p['id']}] {p['text']}" for p in remaining_for_llm])
+        
+        chat_payload = {
+            'model': model_name,
+            'messages': [
+                {'role': 'system', 'content': system_message},
+                {'role': 'user', 'content': llm_prompt}
+            ],
+            'format': {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer"},
+                        "style_name": {"type": "string"},
+                        "bold": {"type": "boolean"},
+                        "italic": {"type": "boolean"},
+                        "font_family": {"type": "string"},
+                        "font_size": {"type": "number"},
+                        "align": {"type": "string"}
+                    },
+                    "required": ["id", "style_name"]
+                }
+            },
+            'stream': True,
+            'options': {
+                'num_ctx': safe_context_budget, 
+                'temperature': 0.1
+            }
+        }
+        
+        clean_url = ollama_url.rstrip('/')
+        target_endpoint = f"{clean_url}/api/chat"
+        buffer_text = ""
+        
         async with httpx.AsyncClient() as client:
             try:
-                # ДИНАМИЧЕСКИЙ ТАЙМАУТ
-                full_prompt_len = len(system_message) + len(user_message)
-                dynamic_timeout = settings.estimate_timeout(full_prompt_len)
-                
-                print(f"⏳ Dynamic Timeout: {dynamic_timeout:.1f}s (Prompt: {full_prompt_len} chars, TPS: {settings.current_tps:.1f})")
-                
-                resp = await client.post(target_endpoint, json=chat_payload, timeout=dynamic_timeout)
-                resp.raise_for_status()
-                ollama_response = resp.json()
-                
-                # /api/chat возвращает ответ в message.content, а не в response
-                raw_llm_text = ""
-                if "message" in ollama_response:
-                    raw_llm_text = ollama_response["message"].get("content", "")
-                elif "response" in ollama_response:
-                    raw_llm_text = ollama_response.get("response", "")
-                
-                parsed_json = extract_json_from_llm_response(raw_llm_text)
-                
-                if parsed_json is not None:
-                    # Приводим ответ к формату, который ожидает клиент (поле "response")
-                    ollama_response["response"] = json.dumps(parsed_json, ensure_ascii=False)
-                    print(f"✅ JSON extracted successfully ({len(parsed_json)} elements)")
-                else:
-                    print(f"⚠️ JSON EXTRACTION FAILED. Raw (first 500 chars): {raw_llm_text[:500]}")
-                    # Оставляем сырой ответ — клиент попробует сам
-                
-                return JSONResponse(content=ollama_response, headers=response_headers)
+                async with client.stream("POST", target_endpoint, json=chat_payload, timeout=600.0) as resp:
+                    resp.raise_for_status()
+                    
+                    async for chunk in resp.aiter_lines():
+                        if await request.is_disconnected(): break
+                        if not chunk: continue
+                        
+                        chunk_data = json.loads(chunk)
+                        chunk_text = chunk_data.get("message", {}).get("content", "")
+                        if chunk_text:
+                            buffer_text += chunk_text
+                            
+                        # Heartbeat
+                        now = time.time()
+                        if now - last_heartbeat > 5.0:
+                            yield " \n"
+                            last_heartbeat = now
+                            
             except Exception as e:
-                # ВАЖНО: Выводим реальную ошибку в консоль
-                print(f"❌ Ollama Error: {type(e).__name__}: {e}")
-                return JSONResponse({"error": f"{type(e).__name__}: {str(e)}"}, status_code=500)
+                print(f"❌ LLM Stream Error: {e}")
+                yield f"{{\"error\": \"{str(e)}\"}}\n"
+                return
 
-    # --- STREAMING ---
-    else:
-        return StreamingResponse(
-            stream_completion(x_target_ollama_url, data), 
-            media_type="text/event-stream",
-            headers=response_headers 
-        )
+        # Парсим JSON-ответ от LLM из буфера (ожидаем dict: {"1": "Style", "5": "Style"})
+        # Динамично извлекаем dict
+        start = buffer_text.find('{')
+        end = buffer_text.rfind('}')
+        
+        llm_handled_ids = set()
+        
+        if start != -1 and end != -1 and end >= start:
+            try:
+                parsed_dict = json.loads(buffer_text[start:end+1])
+                if isinstance(parsed_dict, dict):
+                    num_keys = 0
+                    for k, v in parsed_dict.items():
+                        # Ключ может быть строкой-"числом", значение строкой-стилем
+                        if isinstance(v, str) and str(k).isdigit():
+                            pid = int(k)
+                            yield f"{json.dumps({'id': pid, 'style_name': v}, ensure_ascii=False)}\n"
+                            llm_handled_ids.add(pid)
+                            num_keys += 1
+                            success_count += 1
+                    print(f"✅ LLM Return: {num_keys} elements parsed.")
+            except Exception as e:
+                print(f"❌ Fallback dict parsing failed: {e}")
+                
+        # 4. Fallback (The Catch-All). Если LLM забыла вернуть стили для части ID,
+        #    возвращаем для них "Normal", чтобы LibreOffice не "потерял" эти параграфы.
+        missing_ids = [p["id"] for p in remaining_for_llm if p["id"] not in llm_handled_ids]
+        if missing_ids:
+            print(f"⚠️ LLM lost {len(missing_ids)} IDs! Applying 'Normal' fallback.")
+            for pid in missing_ids:
+                yield f"{json.dumps({'id': pid, 'style_name': 'Normal'}, ensure_ascii=False)}\n"
+                success_count += 1
+                
+        print(f"🏁 Hybrid Stream Finished. Total pushed: {success_count}.")
+        yield "\n"
+
+    response_headers["Content-Type"] = "application/x-ndjson"
+    return StreamingResponse(streaming_generator(), headers=response_headers)
+
+
+
 
 # ... (остальные методы ingest/retrieve те же) ...
 @router.post("/api/ingest")
 async def ingest_document(file: UploadFile = File(...)):
+    """
+    Загружает .docx в RAG-индекс через ChromaDB/SQLite.
+    FileLock (файловый мьютекс): работает при uvicorn --workers N.
+    asyncio.Lock() не защищает от concurrent записи при нескольких воркерах.
+    """
+    # FileLock: кросс-процессный, выполняем в отдельном потоке чтобы не блокировать event loop
+    def _do_ingest(file_path: str, file_ext: str, unique_filename: str):
+        processing_path = file_path
+        if file_ext != "docx":
+            subprocess.run(
+                ["soffice", "--headless", "--convert-to", "docx", file_path, "--outdir", TEMP_DIR],
+                check=True
+            )
+            processing_path = file_path.replace(f".{file_ext}", ".docx")
+            unique_filename = unique_filename.replace(f".{file_ext}", ".docx")
+        with FileLock(_INGEST_LOCK_PATH, timeout=120):
+            rag_engine.add_document(processing_path, unique_filename)
+        return unique_filename
+
     file_ext = file.filename.split(".")[-1].lower()
     unique_filename = f"{uuid.uuid4()}.{file_ext}"
     file_path = os.path.join(TEMP_DIR, unique_filename)
-    with open(file_path, "wb") as buffer: shutil.copyfileobj(file.file, buffer)
-    processing_path = file_path
-    if file_ext != "docx":
-        try:
-            subprocess.run(["soffice", "--headless", "--convert-to", "docx", file_path, "--outdir", TEMP_DIR], check=True)
-            processing_path = file_path.replace(f".{file_ext}", ".docx")
-            unique_filename = unique_filename.replace(f".{file_ext}", ".docx")
-        except Exception as e: return JSONResponse({"error": str(e)}, status_code=500)
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
     try:
-        rag_engine.add_document(processing_path, unique_filename)
-        return JSONResponse({"status": "indexed", "uuid": unique_filename})
-    except Exception as e: return JSONResponse({"error": str(e)}, status_code=500)
+        result_uuid = await asyncio.to_thread(_do_ingest, file_path, file_ext, unique_filename)
+        return JSONResponse({"status": "indexed", "uuid": result_uuid})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 @router.post("/api/retrieve_context")
 def retrieve_context(request: ContextRequest):
@@ -285,3 +438,53 @@ def retrieve_context(request: ContextRequest):
         if data: return {"context": data["full_context"], "source_id": data["source_id"]}
         return {"context": "No reference found.", "source_id": None}
     except Exception as e: return {"context": f"Error: {e}", "source_id": None}
+
+@router.post("/api/extract_ground_truth")
+async def extract_ground_truth_api(file: UploadFile = File(...)):
+    """API для извлечения Ground Truth напрямую из бэкенда (без дублирования логики в тесте)."""
+    file_ext = file.filename.split(".")[-1].lower()
+    unique_filename = f"test_gt_{uuid.uuid4()}.{file_ext}"
+    file_path = os.path.join(TEMP_DIR, unique_filename)
+    
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+        
+    processing_path = file_path
+    if file_ext != "docx":
+        try:
+            subprocess.run(["soffice", "--headless", "--convert-to", "docx", file_path, "--outdir", TEMP_DIR], check=True)
+            processing_path = file_path.replace(f".{file_ext}", ".docx")
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+            
+    try:
+        from app.services.style_extractor import style_extractor
+        chunks = style_extractor.parse_docx(processing_path)
+        
+        # Формируем структуру ответа, аналогичную extract_ground_truth в тесте
+        records = []
+        for chunk in chunks:
+            text = chunk.get("text", "").strip()
+            if not text or text == "<IMAGE_PLACEHOLDER>":
+                continue
+
+            meta = chunk.get("metadata", {})
+            style_desc = chunk.get("style_desc", "")
+
+            record = {
+                "text": text,
+                "style_name": meta.get("style_name", "Normal"),
+                "is_header": meta.get("is_header", False),
+                "section_type": meta.get("section_type", "body"),
+            }
+
+            for m in re.finditer(r'\[([^:]+):\s*([^\]]+)\]', style_desc):
+                record[f"tag_{m.group(1).strip()}"] = m.group(2).strip()
+
+            records.append(record)
+            
+        plain_text = "\n\n".join([r["text"] for r in records if "text" in r])
+        
+        return JSONResponse({"ground_truth": records, "plain_text": plain_text})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)

@@ -1,12 +1,14 @@
 """
-Контест качества форматирования: ВСЕ модели × ВСЕ файлы.
+Тест качества форматирования: ВСЕ модели × ВСЕ файлы.
 
-Автоматически:
-  - Находит все модели с Ollama сервера
-  - Находит все .docx файлы в test_docs/ и в RAG (data/temp/)
-  - Прогоняет каждую пару (модель, файл) через /v1/completions
-  - Сравнивает LLM ответ с ground truth (стили из docx)
-  - Генерирует leaderboard и детальный отчёт
+Вызовы к backend делаются через extension/client.py — тот же код, что выполняет
+расширение LibreOffice при работе пользователя.
+
+Процесс:
+  1. [INGEST] загрузка всех docx в RAG-индекс (через /api/ingest)
+  2. [GT]     параллельное извлечение ground truth (через /api/extract_ground_truth)
+  3. [LLM]   последовательные вызовы /v1/completions для каждой пары (модель, файл)
+  4. [EVAL]  сравнение ответа LLM с GT + проверка UNO-совместимости
 
 Запуск:
   poetry run python tests/test_formatting_quality.py
@@ -31,17 +33,43 @@ from difflib import SequenceMatcher
 from collections import defaultdict
 from typing import Any
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    # Заглушка, если tqdm не установлен
+    class tqdm:  # type: ignore
+        def __init__(self, iterable=None, **kwargs):
+            self._it = iter(iterable) if iterable is not None else iter([])
+            total = kwargs.get("total", "?")
+            desc = kwargs.get("desc", "")
+            print(f"{desc} (всего: {total})")
+        def __iter__(self): return self
+        def __next__(self): return next(self._it)
+        def update(self, n=1): pass
+        def set_postfix_str(self, s): pass
+        def set_postfix(self, **kw): pass
+        def close(self): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+
 # --- Настройка путей ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKEND_ROOT = os.path.dirname(CURRENT_DIR)
+EXTENSION_DIR = os.path.join(os.path.dirname(BACKEND_ROOT), "extension")
+
+# Добавляем extension/ в sys.path для импорта client.py
+if EXTENSION_DIR not in sys.path:
+    sys.path.insert(0, EXTENSION_DIR)
 if BACKEND_ROOT not in sys.path:
     sys.path.insert(0, BACKEND_ROOT)
 
-try:
-    from app.services.style_extractor import style_extractor
-except ImportError as e:
-    print(f"❌ Ошибка импорта: {e}")
-    sys.exit(1)
+# Импорт клиента расширения — тот же код, что выполняет LibreOffice
+from client import (
+    call_apply_template_ndjson,
+    call_ingest,
+    call_extract_ground_truth,
+    validate_uno_fields,
+)
 
 TEST_DOCS_DIR = os.path.join(CURRENT_DIR, "test_docs")
 DATA_TEMP_DIR = os.path.join(BACKEND_ROOT, "data", "temp")
@@ -53,12 +81,11 @@ os.makedirs(REPORTS_DIR, exist_ok=True)
 # АВТО-ОБНАРУЖЕНИЕ
 # ============================================================================
 
-def discover_models(server_url: str, ollama_url: str) -> list[str]:
-    """Получает список ВСЕХ доступных моделей с Ollama через middleware."""
+def discover_models(server_url: str) -> list[str]:
+    """Получает список ВСЕХ доступных моделей через middleware."""
     url = f"{server_url.rstrip('/')}/api/tags"
-    headers = {"X-Target-Ollama-Url": ollama_url}
     try:
-        req = urllib.request.Request(url, headers=headers)
+        req = urllib.request.Request(url, headers={"User-Agent": "LocalWriter-Test"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
             models = [m["name"] for m in data.get("models", [])]
@@ -92,132 +119,57 @@ def discover_docx_files(extra_dirs: list[str] | None = None) -> list[str]:
 # GROUND TRUTH: динамическое извлечение ВСЕХ атрибутов из docx
 # ============================================================================
 
-def extract_ground_truth(docx_path: str) -> list[dict]:
-    """
-    Парсит docx через style_extractor.
-    Все атрибуты извлекаются ДИНАМИЧЕСКИ из тегов [KEY: VALUE].
-    """
-    chunks = style_extractor.parse_docx(docx_path)
-    records = []
-
-    for chunk in chunks:
-        text = chunk.get("text", "").strip()
-        if not text or text == "<IMAGE_PLACEHOLDER>":
-            continue
-
-        meta = chunk.get("metadata", {})
-        style_desc = chunk.get("style_desc", "")
-
-        record: dict[str, Any] = {
-            "text": text,
-            "style_name": meta.get("style_name", "Normal"),
-            "is_header": meta.get("is_header", False),
-            "section_type": meta.get("section_type", "body"),
-        }
-
-        # Динамическое извлечение ВСЕХ тегов
-        for m in re.finditer(r'\[([^:]+):\s*([^\]]+)\]', style_desc):
-            record[f"tag_{m.group(1).strip()}"] = m.group(2).strip()
-
-        records.append(record)
-
-    return records
-
-
-def extract_plain_text(docx_path: str, max_chars: int) -> str:
-    """Извлекает plain text из docx, обрезая при необходимости."""
-    chunks = style_extractor.parse_docx(docx_path)
-    lines = [c["text"].strip() for c in chunks
-             if c.get("text", "").strip() and c["text"] != "<IMAGE_PLACEHOLDER>"]
-    text = "\n\n".join(lines)
-    if len(text) > max_chars:
-        text = text[:max_chars] + "\n... [TRUNCATED]"
-    return text
+# Убраны функции локального извлечения, теперь используем API бэкенда.
 
 
 # ============================================================================
-# LLM ВЫЗОВ
+# ФАЗА 1: загрузка всех docx в RAG (ingest)
 # ============================================================================
 
-def call_llm(
-    text: str,
-    model: str,
+def ingest_documents(
+    files: list[str],
     server_url: str,
-    ollama_url: str,
-    timeout: int = 300,
-) -> tuple[list[dict] | None, float]:
+    workers: int = 4,
+) -> dict[str, str]:
     """
-    Отправляет текст на /v1/completions.
-    Возвращает (parsed_list | None, elapsed_seconds).
+    Загружает все docx через POST /api/ingest (точно как делает расширение при первом запуске).
+    Возвращает {path: uuid | error_message}.
     """
-    url = f"{server_url.rstrip('/')}/v1/completions"
-    payload = {
-        "model": model,
-        "prompt": f"=== USER CONTENT (CONTENT SOURCE) ===\n{text}",
-        "stream": False,
-        "format": "json",
-        "options": {"num_ctx": 8192},
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "X-Target-Ollama-Url": ollama_url,
-    }
-    req = urllib.request.Request(
-        url, data=json.dumps(payload).encode(), headers=headers, method="POST"
-    )
+    results: dict[str, str] = {}
+    lock = threading.Lock()
 
+    def _ingest_one(path: str) -> tuple[str, str]:
+        # Используем функцию из extension/client.py — тот же код, что выполняет расширение
+        resp = call_ingest(path, server_url)
+        if 'error' in resp:
+            return path, f"ERROR: {resp['error']}"
+        return path, resp.get('uuid', 'unknown')
+
+    print(f"\n⎡ [INGEST] Индексирование {len(files)} файлов в RAG (в 1 поток — защита от блокировок SQLite)...")
     start = time.time()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode())
-    except Exception as e:
-        return None, time.time() - start
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        futures = {pool.submit(_ingest_one, f): f for f in files}
+        pbar = tqdm(total=len(files), desc="📂 Ingest", unit="файл", ncols=80)
+        for future in as_completed(futures):
+            path, uuid_or_err = future.result()
+            with lock:
+                results[path] = uuid_or_err
+            fname = os.path.basename(path)
+            ok = not uuid_or_err.startswith("ERROR")
+            pbar.set_postfix_str(f"{'OK' if ok else 'ERR'} {fname}")
+            pbar.update(1)
+        pbar.close()
 
     elapsed = time.time() - start
-    raw = data.get("response", "")
-
-    # Парсинг JSON
-    parsed = _try_parse_json_list(raw)
-    return parsed, elapsed
+    ok_count = sum(1 for v in results.values() if not v.startswith("ERROR"))
+    print(f"  ⏱️  Ingest за {elapsed:.1f}s ({ok_count}/{len(files)} OK)")
+    return results
 
 
-def _try_parse_json_list(raw: str) -> list[dict] | None:
-    """Пытается извлечь JSON list/dict из сырого текста."""
-    if not raw:
-        return None
-
-    # 1. Прямой парсинг
-    try:
-        p = json.loads(raw)
-        if isinstance(p, list):
-            return p
-        if isinstance(p, dict):
-            return [p]
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    # 2. Поиск массива
-    s, e = raw.find('['), raw.rfind(']')
-    if s != -1 and e > s:
-        try:
-            p = json.loads(raw[s:e + 1])
-            if isinstance(p, list):
-                return p
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-    # 3. Поиск объекта
-    s, e = raw.find('{'), raw.rfind('}')
-    if s != -1 and e > s:
-        try:
-            p = json.loads(raw[s:e + 1])
-            if isinstance(p, dict):
-                return [p]
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-    return None
-
+# ============================================================================
+# ФАЗА 2: извлечение ground truth через API
+# ============================================================================
 
 # ============================================================================
 # СРАВНЕНИЕ: полностью динамическое
@@ -235,20 +187,56 @@ _KNOWN_MAPPINGS = {
 
 
 def _normalize(val: Any) -> str:
-    """Нормализует значение для сравнения."""
+    """
+    Нормализует значение для сравнения.
+    Покрывает случаи:
+    - align: "CENTER (1)" / "center" / "1" -> "center"
+    - font_size: "11" -> "11.0"
+    - bool: "True"/"1" -> "true"
+    - section_type: "body" -> "paragraph"
+    """
     if val is None:
         return ""
     s = str(val).strip().lower()
-    if s in ("true", "1", "yes"):
+
+    # Алиасы альянсования (docx число → слово)
+    _ALIGN_MAP: dict[str, str] = {
+        "0": "left", "left": "left",
+        "1": "center", "center": "center",
+        "2": "right", "right": "right",
+        "3": "justify", "justify": "justify", "justified": "justify",
+    }
+
+    # Bool нормализация (до align, чтобы "true"/"false" не ушли в align-мап)
+    if s in ("true", "yes"):
         return "true"
-    if s in ("false", "0", "no"):
+    if s in ("false", "no"):
         return "false"
-    s = re.sub(r'\s*\(\d+\)\s*$', '', s)  # "CENTER (1)" → "center"
-    # section_type ↔ type нормализация
+
+    # Убираем суффикс "(N)" или "_N" для align: "CENTER (1)" -> "center"
+    s_stripped = re.sub(r'[\s_]*\(\s*\d+\s*\)\s*$', '', s).strip()
+
+    # Проверяем align-маппинг (ПОСЛЕ strip суффикса)
+    if s_stripped in _ALIGN_MAP:
+        return _ALIGN_MAP[s_stripped]
+    if s in _ALIGN_MAP:
+        return _ALIGN_MAP[s]
+
+    # font_size: целое число -> флоат ("11" -> "11.0")
+    try:
+        f = float(s_stripped)
+        if f == int(f):  # 11.0 == 11
+            return f"{f:.1f}"
+        return str(f)
+    except ValueError:
+        pass
+
+    # section_type нормализация
     _type_map = {"header": "header", "body": "paragraph", "paragraph": "paragraph"}
-    if s in _type_map:
-        s = _type_map[s]
-    return s
+    if s_stripped in _type_map:
+        return _type_map[s_stripped]
+
+    return s_stripped if s_stripped else s
 
 
 def build_key_map(gt: list[dict], llm: list[dict]) -> dict[str, str]:
@@ -283,28 +271,28 @@ def fuzzy_match(gt_text: str, llm_text: str) -> float:
 
 def evaluate(
     gt_records: list[dict],
-    llm_records: list[dict],
+    llm_records: list[dict], # Это список словарей {"id": N, "style_name": "..."} полученных из NDJSON
 ) -> dict:
     """
-    Полная оценка: matching текстов + динамические метрики.
-    Возвращает словарь с метриками.
+    Полная оценка: строгое совпадение по ID.
+    Template-mode и fuzzy_match удалены по правилу Zero-Mock.
     """
-    key_map = build_key_map(gt_records, llm_records)
+    # Преобразуем список словарей LLM в удобный маппинг по ID
+    llm_map = {}
+    for record in llm_records:
+        pid = record.get("id")
+        if pid is not None:
+            llm_map[int(pid)] = record
 
-    # Matching
+    # Определяем key_map динамически как раньше
+    # (Хотя теперь LLM возвращает в основном только style_name, оставим для универсальности)
+    key_map = build_key_map(gt_records, [r for r in llm_records if isinstance(r, dict)])
+
     matched = []
-    used = set()
-    for gt in gt_records:
-        best_score, best_idx = 0.0, -1
-        for i, llm in enumerate(llm_records):
-            if i in used:
-                continue
-            sc = fuzzy_match(gt.get("text", ""), llm.get("text", ""))
-            if sc > best_score:
-                best_score, best_idx = sc, i
-        if best_idx >= 0 and best_score > 0.3:
-            used.add(best_idx)
-            matched.append({"gt": gt, "llm": llm_records[best_idx], "score": best_score})
+    # GT records идут в строгом порядке, их индексы = ID (0..N-1)
+    for i, gt in enumerate(gt_records):
+        if i in llm_map:
+            matched.append({"gt": gt, "llm": llm_map[i]})
 
     # Метрики покрытия
     result: dict[str, Any] = {
@@ -312,9 +300,7 @@ def evaluate(
         "llm_count": len(llm_records),
         "matched_count": len(matched),
         "text_coverage_pct": round(len(matched) / len(gt_records) * 100, 1) if gt_records else 0,
-        "avg_text_similarity": round(
-            sum(p["score"] for p in matched) / len(matched) * 100, 1
-        ) if matched else 0,
+        "avg_text_similarity": 100.0 if matched else 0.0, # Текст больше не сверяем, он 100% совпадает по ID
         "key_map": key_map,
         "attributes": {},
     }
@@ -333,7 +319,7 @@ def evaluate(
             else:
                 if len(examples) < 3:
                     examples.append({
-                        "text": pair["gt"].get("text", "")[:40],
+                        "text": str(pair["gt"].get("text", ""))[:40],
                         "expected": str(gt_val),
                         "got": str(llm_val),
                     })
@@ -352,48 +338,54 @@ def evaluate(
     return result
 
 
+
+
 def precompute_all_gt(
     files: list[str],
-    max_chars: int,
+    server_url: str,
     workers: int = 4,
 ) -> dict[str, dict]:
     """
-    Параллельно извлекает ground truth и текст из ВСЕХ файлов.
-    Возвращает {path: {"gt": [...], "text": "...", "error": None}} 
+    Параллельно извлекает ground truth и текст из ВСЕХ файлов через API бэкенда.
+    Сервер сам делает батчинг — текст передаётся целиком, как расширение в LibreOffice.
+    Возвращает {path: {"gt": [...], "text": "...", "error": None}}
     """
     cache: dict[str, dict] = {}
     lock = threading.Lock()
-    
+
     def _process_file(path: str) -> tuple[str, dict]:
-        try:
-            gt = extract_ground_truth(path)
-            text = extract_plain_text(path, max_chars)
-            return path, {"gt": gt, "text": text, "error": None}
-        except Exception as e:
-            return path, {"gt": [], "text": "", "error": str(e)}
-    
-    print(f"\n⚡ Предвычисление GT для {len(files)} файлов ({workers} потоков)...")
+        # Используем функцию из extension/client.py — без httpx, без усечения
+        data = call_extract_ground_truth(path, server_url)
+        if 'error' in data:
+            return path, {"gt": [], "text": "", "error": data['error']}
+        return path, {"gt": data.get("ground_truth", []),
+                      "text": data.get("plain_text", ""),
+                      "error": None}
+
+    print(f"\n⚡ [GT] Парсинг GT для {len(files)} файлов ({workers} потоков)...")
     start = time.time()
-    
+
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_process_file, f): f for f in files}
-        done = 0
+        pbar = tqdm(total=len(files), desc="📄 GT-парсинг", unit="файл", ncols=80)
         for future in as_completed(futures):
             path, result = future.result()
             with lock:
                 cache[path] = result
-                done += 1
             fname = os.path.basename(path)
             if result["error"]:
-                print(f"  ❌ [{done}/{len(files)}] {fname}: {result['error']}")
+                pbar.set_postfix_str(f"❌ {fname}: {result['error'][:30]}")
             else:
-                print(f"  ✅ [{done}/{len(files)}] {fname}: {len(result['gt'])} элементов")
-    
+                pbar.set_postfix_str(f"✅ {fname} ({len(result['gt'])} эл.)")
+            pbar.update(1)
+        pbar.close()
+
     elapsed = time.time() - start
     ok_count = sum(1 for v in cache.values() if not v["error"])
     print(f"  ⏱️  GT готов за {elapsed:.1f}s ({ok_count}/{len(files)} файлов ОК)")
-    
+
     return cache
+
 
 
 def _run_single(
@@ -401,107 +393,204 @@ def _run_single(
     file_path: str,
     gt_cache: dict[str, dict],
     server_url: str,
-    ollama_url: str,
     timeout: int,
 ) -> dict:
     """
     Один прогон: модель × файл.
+    Вызывает extension/client.call_apply_template() — точно как расширение LibreOffice.
     GT берётся из кэша (уже предвычислен).
     """
     fname = os.path.basename(file_path)
     cached = gt_cache.get(file_path, {})
-    
+
     if cached.get("error"):
         return _error_result(model, fname, f"GT error: {cached['error']}")
-    
+
     gt = cached.get("gt", [])
     text = cached.get("text", "")
-    
+
     if not gt:
         return _error_result(model, fname, "Empty GT")
+
+    # В новой архитектуре мы передаем список текстов параграфов, чтобы ID совпадали 1к1 с GT
+    paragraphs_texts = [r.get("text", "") for r in gt]
+
+    import queue
+    import threading
     
-    # Вызов LLM (это основной bottleneck)
-    llm_records, elapsed = call_llm(text, model, server_url, ollama_url, timeout)
+    result_queue = queue.Queue()
+    stop_event = threading.Event()
     
-    if llm_records is None:
-        return _error_result(model, fname, "No JSON", elapsed)
+    start_time = time.time()
+
+    # Вызов /v1/completions через NDJSON-бачтер (гибридный клиент)
+    try:
+        is_degraded, rag_template_id = call_apply_template_ndjson(
+            content=paragraphs_texts,
+            model=model,
+            middleware_url=server_url,
+            result_queue=result_queue,
+            stop_event=stop_event,
+            timeout_per_line=timeout,
+        )
+    except Exception as e:
+        return _error_result(model, fname, f"API Exception: {e}", time.time() - start_time)
+
+    llm_records = []
+    has_error = False
+    error_msg = ""
     
-    # Оценка
+    while True:
+        try:
+            # Даем таймаут на 1 батч
+            item = result_queue.get(timeout=60)
+            if "DONE" in item:
+                break
+            if "error" in item:
+                has_error = True
+                error_msg = item["error"]
+                break
+            
+            llm_records.append(item)
+            
+        except queue.Empty:
+            has_error = True
+            error_msg = "Timeout waiting for backend queue"
+            stop_event.set()
+            break
+
+    elapsed = time.time() - start_time
+
+    if has_error:
+        return _error_result(model, fname, f"Stream Error: {error_msg}", elapsed)
+
+    if not llm_records:
+        return _error_result(model, fname, "No JSON generated", elapsed)
+
+    # Оценка качества форматирования
     metrics = evaluate(gt, llm_records)
     metrics["model"] = model
     metrics["file"] = fname
     metrics["elapsed_sec"] = round(elapsed, 1)
     metrics["status"] = "OK"
-    
+    metrics["rag_found"] = bool(rag_template_id)
+    metrics["rag_template_id"] = rag_template_id or ""
+
+    # Проверка UNO-совместимости (поля, которые ожидает uno_formatter.apply_structure)
+    uno_info = validate_uno_fields(llm_records)
+    metrics["uno_compat_pct"] = uno_info["compat_pct"]
+    metrics["uno_with_style_pct"] = round(
+        uno_info["with_style"] / uno_info["total"] * 100, 1
+    ) if uno_info["total"] else 0.0
+
     return metrics
+
+
+
+def _append_model_section(
+    report_path: str,
+    model_results: list[dict],
+    model_name: str,
+) -> None:
+    """
+    Дописывает в Markdown-отчёт секцию с результатами для одной модели.
+    """
+    lines = [f"## 🤖 Модель: `{model_name}`", ""]
+    lines.append("| Файл | Status | RAG | Coverage | Score | UNO% | Time |")
+    lines.append("|---|---|---|---|---|---|---|")
+    for r in model_results:
+        icon = "✅" if r["status"] == "OK" else "❌"
+        rag_icon = "✅" if r.get("rag_found") else "✖️"
+        lines.append(
+            f"| `{r['file']}` | {icon} {r['status']} | {rag_icon} | "
+            f"{r.get('text_coverage_pct', 0):.1f}% | "
+            f"{r.get('overall_score', 0):.1f}% | "
+            f"{r.get('uno_compat_pct', 0):.0f}% | "
+            f"{r.get('elapsed_sec', 0):.1f}s |"
+        )
+    lines.append("")
+    with open(report_path, "a", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
 
 
 def run_contest(
     models: list[str],
     files: list[str],
     server_url: str,
-    ollama_url: str,
-    max_chars: int,
     timeout: int,
     workers: int = 4,
+    report_path: str | None = None,
 ) -> list[dict]:
     """
-    Прогоняет все комбинации (модель × файл).
-    GT предвычисляется параллельно, LLM вызовы — СТРОГО ПОСЛЕДОВАТЕЛЬНО:
-    заканчиваем один файл, переходим к следующему.
+    Прогон контеста в 3 фазы:
+      1. [INGEST] загрузка всех docx в RAG-индекс (1 поток — защита от блокировок SQLite ChromaDB)
+      2. [GT]     параллельное извлечение ground truth (/api/extract_ground_truth)
+      3. [LLM]   последовательные вызовы /v1/completions
+    Все HTTP-вызовы через extension/client.py.
     """
-    # Фаза 1: параллельное предвычисление GT (CPU-bound, безопасно)
-    gt_cache = precompute_all_gt(files, max_chars, workers=workers)
-    
-    # Фаза 2: ПОСЛЕДОВАТЕЛЬНЫЕ LLM вызовы
-    # Порядок: для каждого файла прогоняем все модели, потом следующий файл
+    # Фаза 1: INGEST (наполняем RAG-индекс)
+    ingest_documents(files, server_url, workers=workers)
+
+    # Фаза 2: параллельное извлечение GT
+    gt_cache = precompute_all_gt(files, server_url, workers=workers)
+
+    # Фаза 3: ПОСЛЕДОВАТЕЛЬНЫЕ LLM вызовы
     total_runs = len(models) * len(files)
-    results = []
+    results: list[dict] = []
     start_time = time.time()
-    done = 0
-    
-    print(f"\n🚀 Запуск контеста: {total_runs} прогонов (последовательно)")
-    
-    for file_idx, file_path in enumerate(files, 1):
-        fname = os.path.basename(file_path)
-        print(f"\n{'='*60}")
-        print(f"📄 [{file_idx}/{len(files)}] {fname}")
-        print(f"{'='*60}")
-        
-        for model in models:
-            done += 1
-            
+
+    print(f"\n🚀 [LLM] Запуск контеста: {total_runs} прогонов (последовательно)")
+    if report_path:
+        print(f"📝 Real-time отчёт: {report_path}")
+
+    pbar = tqdm(
+        total=total_runs,
+        desc="🏁 Контест",
+        unit="прогон",
+        ncols=90,
+        colour="green",
+    )
+
+    for model in models:
+        pbar.set_postfix_str(f"🤖 {model}")
+        model_results: list[dict] = []
+
+        for file_path in files:
+            fname = os.path.basename(file_path)
+            pbar.set_postfix_str(f"📄 {fname[:25]} × {model}")
+
             result = _run_single(
                 model, file_path, gt_cache,
-                server_url, ollama_url, timeout
+                server_url, timeout,
             )
             results.append(result)
-            
-            # Прогресс + ETA
-            elapsed_total = time.time() - start_time
-            avg_per_run = elapsed_total / done
-            eta = avg_per_run * (total_runs - done)
-            
+            model_results.append(result)
+            pbar.update(1)
+
             status = result.get("status", "?")
             if status == "OK":
                 cov = result.get('text_coverage_pct', 0)
                 score = result.get('overall_score', 0)
-                elems = result.get('llm_count', 0)
-                print(
-                    f"  ✅ [{done}/{total_runs}] 🤖 {model} | "
-                    f"Cov={cov}% Score={score}% Elems={elems} | "
-                    f"ETA: {eta/60:.1f}min"
+                uno = result.get('uno_compat_pct', 0)
+                rag = "✅" if result.get('rag_found') else "✖️"
+                tqdm.write(
+                    f"  ✅ {model} × {fname} | "
+                    f"RAG={rag} Cov={cov:.1f}% Score={score:.1f}% UNO={uno:.0f}%"
                 )
             else:
-                print(
-                    f"  ❌ [{done}/{total_runs}] 🤖 {model} | "
-                    f"{status} | ETA: {eta/60:.1f}min"
-                )
-    
+                tqdm.write(f"  ❌ {model} × {fname} | {status}")
+
+        if report_path:
+            _append_model_section(report_path, model_results, model)
+            tqdm.write(f"  📝 Записано в отчёт: {model}")
+
+    pbar.close()
     total_elapsed = time.time() - start_time
     print(f"\n⏱️  Контест завершён за {total_elapsed/60:.1f} минут")
-    
+
     return results
+
 
 
 def _error_result(model: str, fname: str, error: str, elapsed: float = 0) -> dict:
@@ -516,6 +605,10 @@ def _error_result(model: str, fname: str, error: str, elapsed: float = 0) -> dic
         "avg_text_similarity": 0,
         "overall_score": 0,
         "elapsed_sec": round(elapsed, 1),
+        "rag_found": False,
+        "rag_template_id": "",
+        "uno_compat_pct": 0.0,
+        "uno_with_style_pct": 0.0,
         "attributes": {},
         "key_map": {},
     }
@@ -525,10 +618,114 @@ def _error_result(model: str, fname: str, error: str, elapsed: float = 0) -> dic
 # ОТЧЁТ: Leaderboard + детали
 # ============================================================================
 
-def save_contest_report(results: list[dict], output_dir: str) -> str:
-    """Генерирует Markdown leaderboard и JSON дамп."""
+# ============================================================================
+# ИНФОГРАФИКА (ASCII bar charts)
+# ============================================================================
+
+def _bar(value: float, max_val: float = 100.0, width: int = 20, fill: str = "█", empty: str = "░") -> str:
+    """Рисует ASCII прогресс-бар для значения 0..max_val."""
+    if max_val <= 0:
+        max_val = 100.0
+    filled = int(round(value / max_val * width))
+    filled = max(0, min(width, filled))
+    return fill * filled + empty * (width - filled)
+
+
+def _infographic_summary(leaderboard: list[dict], results: list[dict]) -> list[str]:
+    """
+    Строит текстовую инфографику:
+      - Bar chart Coverage и Score для каждой модели
+      - Топ-3 модели
+      - Статистика по файлам
+    """
+    lines: list[str] = []
+    lines.append("")
+    lines.append("## 📊 Инфографика")
+    lines.append("")
+
+    # --- Bar chart моделей ---
+    lines.append("### Сравнение моделей (Coverage / Score)")
+    lines.append("")
+    lines.append("```")
+    lines.append(f"{'Модель':<32} {'Coverage':>10}  {'Score':>8}")
+    lines.append("-" * 70)
+    for lb in leaderboard:
+        name = lb["model"][:31]
+        cov = lb["avg_coverage"]
+        score = lb["avg_overall"]
+        bar_cov = _bar(cov, width=15)
+        bar_score = _bar(score, width=10)
+        lines.append(
+            f"{name:<32} {bar_cov} {cov:5.1f}%  {bar_score} {score:5.1f}%"
+        )
+    lines.append("```")
+    lines.append("")
+
+    # --- Топ-3 ---
+    lines.append("### 🏆 Топ-3 модели")
+    lines.append("")
+    medals = ["🥇", "🥈", "🥉"]
+    for i, lb in enumerate(leaderboard[:3]):
+        lines.append(
+            f"{medals[i]} **{lb['model']}** — "
+            f"Coverage: `{lb['avg_coverage']:.1f}%`, "
+            f"Score: `{lb['avg_overall']:.1f}%`, "
+            f"Файлов ОК: `{lb['files_ok']}/{lb['files_tested']}`"
+        )
+    lines.append("")
+
+    # --- Статистика по файлам ---
+    files_in_results = sorted(set(r["file"] for r in results))
+    lines.append("### 📄 Статистика по файлам")
+    lines.append("")
+    lines.append("```")
+    lines.append(f"{'Файл':<35} {'OK':>4} {'FAIL':>5} {'Avg Score':>10}")
+    lines.append("-" * 60)
+    for fname in files_in_results:
+        file_runs = [r for r in results if r["file"] == fname]
+        ok_runs = [r for r in file_runs if r["status"] == "OK"]
+        fail_count = len(file_runs) - len(ok_runs)
+        avg_score = (
+            sum(r["overall_score"] for r in ok_runs) / len(ok_runs)
+            if ok_runs else 0
+        )
+        bar = _bar(avg_score, width=12)
+        lines.append(
+            f"{fname[:34]:<35} {len(ok_runs):>4} {fail_count:>5}  {bar} {avg_score:5.1f}%"
+        )
+    lines.append("```")
+    lines.append("")
+
+    # --- Общая статистика ---
+    total = len(results)
+    ok_total = sum(1 for r in results if r["status"] == "OK")
+    fail_total = total - ok_total
+    lines.append("### ℹ️ Общая статистика")
+    lines.append("")
+    lines.append(f"- **Всего прогонов:** {total}")
+    lines.append(f"- **Успешно:** {ok_total} ({ok_total/total*100:.1f}%)")
+    lines.append(f"- **Ошибок:** {fail_total} ({fail_total/total*100:.1f}%)")
+    if ok_total:
+        avg_cov_all = sum(r["text_coverage_pct"] for r in results if r["status"] == "OK") / ok_total
+        avg_score_all = sum(r["overall_score"] for r in results if r["status"] == "OK") / ok_total
+        lines.append(f"- **Средняя Coverage:** {avg_cov_all:.1f}%")
+        lines.append(f"- **Средний Score:** {avg_score_all:.1f}%")
+    lines.append("")
+
+    return lines
+
+
+def save_contest_report(
+    results: list[dict],
+    output_dir: str,
+    realtime_path: str | None = None,
+) -> str:
+    """
+    Генерирует итоговый Markdown leaderboard, инфографику и JSON дамп.
+    Если realtime_path указан — добавляет сводку поверх уже записанного файла.
+    """
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    md_path = os.path.join(output_dir, f"contest_{ts}.md")
+    md_path = realtime_path or os.path.join(output_dir, f"contest_{ts}.md")
     json_path = os.path.join(output_dir, f"contest_{ts}.json")
 
     # --- Leaderboard ---
@@ -572,11 +769,12 @@ def save_contest_report(results: list[dict], output_dir: str) -> str:
     # Сортировка: лучшие сверху (coverage * overall)
     leaderboard.sort(key=lambda x: (x["avg_coverage"] * x["avg_overall"]), reverse=True)
 
-    # --- Markdown ---
-    lines = [
+    # --- Шапка Markdown ---
+    header_lines = [
         f"# 🏆 Formatting Contest Report",
         f"**Дата:** {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        f"**Моделей:** {len(model_scores)} | **Файлов:** {len(set(r['file'] for r in results))} | "
+        f"**Моделей:** {len(model_scores)} | "
+        f"**Файлов:** {len(set(r['file'] for r in results))} | "
         f"**Прогонов:** {len(results)}",
         "",
         "## Leaderboard",
@@ -587,25 +785,28 @@ def save_contest_report(results: list[dict], output_dir: str) -> str:
 
     for i, lb in enumerate(leaderboard, 1):
         medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-        lines.append(
+        header_lines.append(
             f"| {medal} | `{lb['model']}` | {lb['files_ok']}/{lb['files_failed']} | "
             f"{lb['avg_coverage']:.1f}% | {lb['avg_overall']:.1f}% | "
             f"{lb['avg_elements']:.0f} | {lb['avg_time_sec']:.1f}s |"
         )
 
-    # --- Детали по каждому прогону ---
-    lines.extend(["", "## Детали по прогонам", ""])
+    # --- Инфографика (сводка) ---
+    infographic_lines = _infographic_summary(leaderboard, results)
+
+    # --- Разделитель перед детальными прогонами ---
+    detail_lines = ["", "## Детали по прогонам", ""]
 
     for r in results:
         status_icon = "✅" if r["status"] == "OK" else "❌"
-        lines.append(f"### {status_icon} `{r['model']}` × `{r['file']}`")
+        detail_lines.append(f"### {status_icon} `{r['model']}` × `{r['file']}`")
 
         if r["status"] != "OK":
-            lines.append(f"**Статус:** {r['status']}")
-            lines.append("")
+            detail_lines.append(f"**Статус:** {r['status']}")
+            detail_lines.append("")
             continue
 
-        lines.append(
+        detail_lines.append(
             f"Coverage: {r['text_coverage_pct']}% | "
             f"Score: {r['overall_score']}% | "
             f"Elements: {r['llm_count']}/{r['gt_count']} | "
@@ -613,52 +814,85 @@ def save_contest_report(results: list[dict], output_dir: str) -> str:
         )
 
         if r.get("attributes"):
-            lines.append("")
-            lines.append("| Атрибут | Accuracy | Correct/Total |")
-            lines.append("|---|---|---|")
+            detail_lines.append("")
+            detail_lines.append("| Атрибут | Accuracy | Correct/Total |")
+            detail_lines.append("|---|---|---|")
             for attr, info in sorted(r["attributes"].items(), key=lambda x: x[1]["accuracy"]):
                 icon = "✅" if info["accuracy"] >= 80 else "⚠️" if info["accuracy"] >= 50 else "❌"
-                lines.append(
+                detail_lines.append(
                     f"| {icon} `{attr}` | {info['accuracy']:.1f}% | {info['correct']}/{info['total']} |"
                 )
 
             # Примеры ошибок (компактно)
             has_examples = any(info["examples"] for info in r["attributes"].values())
             if has_examples:
-                lines.append("")
-                lines.append("<details><summary>Примеры ошибок</summary>")
-                lines.append("")
+                detail_lines.append("")
+                detail_lines.append("<details><summary>Примеры ошибок</summary>")
+                detail_lines.append("")
                 for attr, info in r["attributes"].items():
                     for ex in info["examples"]:
-                        lines.append(f"- **{attr}**: `{ex['text']}...` — ожидалось `{ex['expected']}`, получено `{ex['got']}`")
-                lines.append("")
-                lines.append("</details>")
+                        text_snippet = ex.get('text', '')
+                        prefix = f"`{text_snippet}...` — " if text_snippet else ""
+                        detail_lines.append(
+                            f"- **{attr}**: {prefix}ожидалось `{ex['expected']}`, получено `{ex['got']}`"
+                        )
+                detail_lines.append("")
+                detail_lines.append("</details>")
 
-        lines.append("")
+        detail_lines.append("")
+
+    # --- Запись финального Markdown ---
+    # Если realtime_path задан — перезаписываем (добавляем шапку + инфографику перед накопленными секциями)
+    if realtime_path and os.path.exists(realtime_path):
+        # Читаем уже накопленный real-time контент (секции файлов)
+        with open(realtime_path, "r", encoding="utf-8") as f:
+            realtime_content = f.read()
+        # Итоговый документ: шапка → инфографика → real-time секции → детали
+        full_content = (
+            "\n".join(header_lines + infographic_lines)
+            + "\n## Прогоны по файлам (real-time)\n\n"
+            + realtime_content
+            + "\n"
+            + "\n".join(detail_lines)
+        )
+    else:
+        full_content = "\n".join(header_lines + infographic_lines + detail_lines)
 
     with open(md_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+        f.write(full_content)
 
     # --- JSON (без examples для компактности) ---
     json_data = {
         "timestamp": datetime.now().isoformat(),
         "leaderboard": leaderboard,
-        "runs": [{k: v for k, v in r.items() if k != "key_map"} for r in results],
+        "runs": [
+            {k: v for k, v in r.items() if k not in ("key_map", "llm_records", "gt_records")}
+            for r in results
+        ],
     }
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(json_data, f, ensure_ascii=False, indent=2)
 
-    print(f"\n📊 Leaderboard: {md_path}")
-    print(f"📦 JSON: {json_path}")
+    print(f"\n📊 Отчёт: {md_path}")
+    print(f"📦 JSON:  {json_path}")
 
-    # Консольный leaderboard
-    print(f"\n{'='*60}")
+    # --- Консольный leaderboard с инфографикой ---
+    W = 70
+    print(f"\n{'='*W}")
     print("🏆 LEADERBOARD")
-    print(f"{'='*60}")
+    print(f"{'='*W}")
+    print(f"  {'Модель':<30} {'Coverage':>10}  {'Score':>8}")
+    print(f"  {'-'*60}")
     for i, lb in enumerate(leaderboard, 1):
         medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"  {i}."
-        print(f"  {medal} {lb['model']:30s} Coverage={lb['avg_coverage']:5.1f}%  "
-              f"Score={lb['avg_overall']:5.1f}%  Elements={lb['avg_elements']:5.0f}")
+        bar_cov = _bar(lb['avg_coverage'], width=12)
+        bar_score = _bar(lb['avg_overall'], width=8)
+        print(
+            f"  {medal} {lb['model']:<28} "
+            f"{bar_cov} {lb['avg_coverage']:5.1f}%  "
+            f"{bar_score} {lb['avg_overall']:5.1f}%"
+        )
+    print(f"{'='*W}")
 
     return md_path
 
@@ -671,33 +905,42 @@ def main():
     parser = argparse.ArgumentParser(description="Formatting Quality Contest")
     parser.add_argument("--server", "-s", default="http://localhost:8323",
                         help="URL middleware сервера")
-    parser.add_argument("--ollama", "-o", default="http://192.168.0.107:11434",
-                        help="URL Ollama сервера")
     parser.add_argument("--model", "-m", default=None,
                         help="Конкретная модель (по умолчанию — все)")
     parser.add_argument("--file", "-f", default=None,
                         help="Конкретный .docx файл (по умолчанию — все из test_docs/)")
     parser.add_argument("--timeout", "-t", type=int, default=300,
                         help="Таймаут на один LLM вызов (секунды)")
-    parser.add_argument("--max-chars", type=int, default=12000,
-                        help="Максимальная длина текста для LLM")
     parser.add_argument("--max-files", type=int, default=0,
                         help="Лимит файлов (0 = без лимита)")
     parser.add_argument("--workers", "-w", type=int, default=4,
-                        help="Количество параллельных потоков")
+                        help="Количество параллельных потоков (ingest/GT)")
     args = parser.parse_args()
 
     print("🏁 FORMATTING QUALITY CONTEST")
     print(f"   Server: {args.server}")
-    print(f"   Ollama: {args.ollama}")
+
+    config_path = os.path.join(os.path.dirname(__file__), "test_config.json")
+    excluded_models = ["translategemma:12b", "translategemma:latest"]
+    try:
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+                excluded_models = cfg.get("excluded_models", excluded_models)
+                args.server = cfg.get("server_url", args.server)
+                print(f"   🔧 Config loaded (excluded: {len(excluded_models)})")
+    except Exception:
+        pass
 
     # --- Модели ---
     if args.model:
         models = [args.model]
     else:
-        models = discover_models(args.server, args.ollama)
+        models = discover_models(args.server)
+        if excluded_models:
+            models = [m for m in models if not any(ex in m for ex in excluded_models)]
         if not models:
-            print("❌ Моделей не найдено")
+            print("❌ Моделей не найдено (или все исключены)")
             sys.exit(1)
 
     print(f"\n🤖 Модели ({len(models)}):")
@@ -730,24 +973,66 @@ def main():
         print(f"   - {os.path.basename(f)}")
 
     print(f"\n📐 Всего прогонов: {len(models)} × {len(files)} = {len(models) * len(files)}")
-    print(f"   Max chars: {args.max_chars} | Timeout: {args.timeout}s")
+    print(f"   Timeout: {args.timeout}s | Workers: {args.workers}")
+    print(f"   Extension client: {EXTENSION_DIR}/client.py")
+
+    # --- Путь для real-time записи ---
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    realtime_report_path = os.path.join(REPORTS_DIR, f"contest_{ts}.md")
+    # Инициализируем файл (пустой, будем дописывать по ходу)
+    with open(realtime_report_path, "w", encoding="utf-8") as f:
+        f.write(f"<!-- Отчёт создан: {datetime.now().isoformat()} — будет дополняться -->\n\n")
 
     # --- Контест ---
     results = run_contest(
         models=models,
         files=files,
         server_url=args.server,
-        ollama_url=args.ollama,
-        max_chars=args.max_chars,
         timeout=args.timeout,
         workers=args.workers,
+        report_path=realtime_report_path,
     )
 
-    # --- Отчёт ---
+    # --- Итоговый отчёт (перезапишет файл, добавив шапку + инфографику) ---
     if results:
-        save_contest_report(results, REPORTS_DIR)
+        save_contest_report(results, REPORTS_DIR, realtime_path=realtime_report_path)
     else:
-        print("❌ Нет результатов")
+        print("❌ Нет результатов — выходим с ошибкой")
+        sys.exit(1)
+
+    # --- Объективная проверка качества (защита от False Positive) ---
+    # Считаем только прогоны со статусом OK (не FAIL / Connection refused)
+    ok_results = [r for r in results if r.get("status") == "OK"]
+    fail_results = [r for r in results if r.get("status") != "OK"]
+
+    if fail_results:
+        print(f"\n⚠️  Провальных прогонов: {len(fail_results)}/{len(results)}")
+        for r in fail_results[:5]:  # показываем первые 5
+            print(f"   ❌ {r['model']} × {r['file']} — {r['status']}")
+
+    # Если вообще нет успешных прогонов — критичная ошибка (сервер недоступен, GT подал 0 файлов и т.д.)
+    if not ok_results:
+        print(
+            "\n❌ КРИТИЧНО: Все прогоны завершились неуспешно (FAIL). "
+            "Убедитесь, что сервер запущен и доступен."
+        )
+        sys.exit(1)
+
+    # Если средний Score по OK-прогонам == 0% — LLM не вернула ничего осмысленного
+    avg_score = sum(r.get("overall_score", 0) for r in ok_results) / len(ok_results)
+    avg_coverage = sum(r.get("text_coverage_pct", 0) for r in ok_results) / len(ok_results)
+
+    print(f"\n📊 Итог: avg_score={avg_score:.1f}% | avg_coverage={avg_coverage:.1f}% "
+          f"| ok={len(ok_results)} | fail={len(fail_results)}")
+
+    if avg_score == 0.0 and avg_coverage == 0.0:
+        print(
+            "\n❌ КРИТИЧНО: Средний Score=0% и Coverage=0% по всем успешным прогонам. "
+            "LLM не вернула осмысленного ответа."
+        )
+        sys.exit(1)
+
+    print("\n✅ E2E тест пройден объективно.")
 
 
 if __name__ == "__main__":

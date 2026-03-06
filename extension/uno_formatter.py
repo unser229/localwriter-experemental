@@ -95,6 +95,40 @@ class UnoFormatter:
             self.text.insertControlCharacter(cursor, PARAGRAPH_BREAK, False)
         except: pass
 
+    def ensure_style_exists(self, style_name, block_data):
+        """Проверяет существование стиля. Если нет - создает на базе Standard и применяет визуальные свойства"""
+        if not style_name: return
+        
+        try:
+            style_families = self.doc.StyleFamilies
+            paragraph_styles = style_families.getByName("ParagraphStyles")
+            
+            if not paragraph_styles.hasByName(style_name):
+                # 1. Создаем новый стиль
+                new_style = self.doc.createInstance("com.sun.star.style.ParagraphStyle")
+                # 2. Наследуем от Стандартного
+                new_style.ParentStyle = "Standard"
+                # 3. Добавляем в семейство стилей документа
+                paragraph_styles.insertByName(style_name, new_style)
+                
+                # 4. Накатываем визуальные параметры (Semantic Mapping) в СТИЛЬ
+                if "font_family" in block_data:
+                    new_style.CharFontName = block_data["font_family"]
+                if "font_size" in block_data:
+                    try: new_style.CharHeight = float(block_data["font_size"])
+                    except: pass
+                if block_data.get("bold") is True: 
+                    new_style.CharWeight = 150.0 # BOLD
+                if block_data.get("italic") is True: 
+                    new_style.CharPosture = 1    # ITALIC
+                
+                align = block_data.get("align", "").lower()
+                if align == "center": new_style.ParaAdjust = CENTER
+                elif align == "right": new_style.ParaAdjust = RIGHT
+                elif align in ["justify", "block"]: new_style.ParaAdjust = BLOCK
+        except Exception as e:
+            print(f"Style creation error: {e}")
+
     def apply_structure(self, json_structure):
         """Главный метод применения верстки"""
         

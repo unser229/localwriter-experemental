@@ -2,10 +2,6 @@ import os
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
-# --- FIX IMPORT ---
-# Пытаемся импортировать из app.api.endpoints (где он лежал раньше)
-# Если не выйдет, пробуем из app.endpoints
 try:
     from app.api.endpoints import router as api_router
 except ImportError:

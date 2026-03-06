@@ -6,7 +6,10 @@ class HardwareProfile:
         vm = psutil.virtual_memory()
         self.available_ram_gb = vm.available / (1024 ** 3)
         self.physical_cores = psutil.cpu_count(logical=False) or 2
-        
+
+        # URL локальной Ollama — бэкенд всегда работает с ней напрямую
+        self.OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+
         # Начальная эвристика
         self.is_low_power = self.available_ram_gb < 8.0 or self.physical_cores < 6
         self.current_tps = 10.0 # Дефолтное значение (безопасное) до калибровки
@@ -42,22 +45,24 @@ class HardwareProfile:
         """
         # Оценка количества входных токенов
         input_tokens = input_char_len / 3.0
-        
-        # Оценка выходных токенов (JSON структуры обычно не гигантские, но берем с запасом)
-        expected_output_tokens = 2048 
-        
+
+        # Оценка выходных токенов: ~1 JSON-объект на каждые 200 символов входа,
+        # каждый объект ~100 токенов. Минимум 512, максимум 8192.
+        estimated_output_objects = max(1, input_char_len // 200)
+        expected_output_tokens = min(8192, max(512, estimated_output_objects * 100))
+
         total_workload = input_tokens + expected_output_tokens
-        
+
         # Время = Объем / Скорость
         # Если TPS не измерен (0), берем 5.0 как safe-mode
         speed = self.current_tps if self.current_tps > 0 else 5.0
-        
+
         estimated_seconds = total_workload / speed
-        
-        # Добавляем 20% буфера + 10 секунд на сеть/лаги
-        final_timeout = (estimated_seconds * 1.2) + 10.0
-        
-        # Не меньше 60 секунд
-        return max(60.0, final_timeout)
+
+        # Добавляем 30% буфера + 15 секунд на сеть/лаги
+        final_timeout = (estimated_seconds * 1.3) + 15.0
+
+        # Не меньше 90 секунд
+        return max(90.0, final_timeout)
 
 settings = HardwareProfile()
