@@ -450,6 +450,8 @@ def _run_single(
                 has_error = True
                 error_msg = item["error"]
                 break
+            if "heartbeat" in item:
+                continue
             
             llm_records.append(item)
             
@@ -469,6 +471,16 @@ def _run_single(
 
     # Оценка качества форматирования
     metrics = evaluate(gt, llm_records)
+    
+    # Если результат нулевой, выводим сырой ответ для отладки
+    if metrics.get("overall_score", 0) == 0:
+        print(f"\n⚠️  [DEBUG] Model {model} failed on {fname}. RAW response from /tmp/localwriter_raw.log:")
+        try:
+            if os.path.exists('/tmp/localwriter_raw.log'):
+                with open('/tmp/localwriter_raw.log', 'r') as f:
+                    log_tail = f.readlines()[-20:] # Последние 20 строк
+                    print("".join(log_tail))
+        except: pass
     metrics["model"] = model
     metrics["file"] = fname
     metrics["elapsed_sec"] = round(elapsed, 1)

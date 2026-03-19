@@ -229,6 +229,7 @@ def call_apply_template_ndjson(
                     break
                     
                 batch = paragraphs[batch_start : batch_start + BATCH_SIZE]
+                batch_raw_accumulated = ""
                 
                 # Формируем payload для нового гибридного API
                 # Отправляем JSON-массив параграфов внутри prompt
@@ -267,7 +268,11 @@ def call_apply_template_ndjson(
                             
                         line_str = line.decode('utf-8').strip()
                         if not line_str:
+                            # Пробрасываем Heartbeat в очередь, чтобы тест не упал по таймауту
+                            result_queue.put({"heartbeat": True})
                             continue # Heartbeat
+                            
+                        batch_raw_accumulated += line_str + "\n"
                             
                         try:
                             parsed_obj = json.loads(line_str)
@@ -282,6 +287,13 @@ def call_apply_template_ndjson(
                             pass
                             
                     response.close()
+                    
+                    # Если батч не дал результатов, логируем сырой ответ
+                    if not any(isinstance(item, dict) and "id" in item for item in list(result_queue.queue)):
+                        try:
+                            with open('/tmp/localwriter_raw.log', 'a', encoding='utf-8') as f:
+                                f.write(f"\n--- RAW BATCH RESPONSE ---\n{batch_raw_accumulated[:2000]}\n")
+                        except: pass
                     
                 except Exception as batch_e:
                     result_queue.put({"error": f"Batch Error: {str(batch_e)}"})

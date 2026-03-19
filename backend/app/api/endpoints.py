@@ -5,6 +5,7 @@ import json
 import re
 import urllib.parse
 import httpx
+import time
 from typing import List, Optional
 from fastapi import APIRouter, Request, Header, UploadFile, File
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
@@ -16,6 +17,7 @@ import subprocess
 import asyncio
 from app.config import settings
 from filelock import FileLock
+import json_repair
 
 # Файловый мьютекс для /api/ingest: работает при uvicorn --workers N (несколько процессов).
 # asyncio.Lock() работает только внутри одного процесса — при нескольких воркерах не защищает.
@@ -235,8 +237,8 @@ async def proxy_completions(request: Request):
                 "YOU ARE A JSON-ONLY STYLE CLASSIFIER.\n"
                 "DO NOT SUMMARIZE. DO NOT ADD TEXT. DO NOT REASON.\n"
                 f"Available exact style names: {styles_json}\n\n"
-                "Return exactly ONE JSON dict mapping 'id' to 'style_name', like this:\n"
-                "{\n  \"1\": \"Normal\",\n  \"2\": \"Heading 1\"\n}\n"
+                "Return exactly ONE JSON dict where keys are IDs (strings) and values are style names.\n"
+                "Example format: {\"1\": \"Normal\", \"2\": \"Heading 1\"}\n"
             )
 
     response_headers = {}
@@ -278,8 +280,10 @@ async def proxy_completions(request: Request):
     # =========================================================================
     async def streaming_generator():
         success_count = 0
-        import time
         last_heartbeat = time.time()
+        
+        # Немедленный Heartbeat, чтобы клиент (urllib) не отвалился по таймауту 30с
+        yield " \n"
         
         # 1. Стримим готовые результаты из A (Heuristics) и B (Vector)
         for pid, style in final_merged_results.items():
@@ -293,7 +297,7 @@ async def proxy_completions(request: Request):
             return
             
         # 3. Шаг C: Идем в LLM только с самыми сложными параграфами
-        print(f"🤖 Calling LLM for {len(remaining_for_llm)} objects...")
+        print(f"🤖 Calling LLM for {len(remaining_for_llm)} objects...", flush=True)
         
         # Формируем промпт из параграфов формата [ID] Text
         llm_prompt = "\n".join([f"[{p['id']}] {p['text']}" for p in remaining_for_llm])
@@ -305,20 +309,8 @@ async def proxy_completions(request: Request):
                 {'role': 'user', 'content': llm_prompt}
             ],
             'format': {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "integer"},
-                        "style_name": {"type": "string"},
-                        "bold": {"type": "boolean"},
-                        "italic": {"type": "boolean"},
-                        "font_family": {"type": "string"},
-                        "font_size": {"type": "number"},
-                        "align": {"type": "string"}
-                    },
-                    "required": ["id", "style_name"]
-                }
+                "type": "object",
+                "additionalProperties": {"type": "string"}
             },
             'stream': True,
             'options': {
@@ -356,29 +348,40 @@ async def proxy_completions(request: Request):
                 yield f"{{\"error\": \"{str(e)}\"}}\n"
                 return
 
-        # Парсим JSON-ответ от LLM из буфера (ожидаем dict: {"1": "Style", "5": "Style"})
-        # Динамично извлекаем dict
-        start = buffer_text.find('{')
-        end = buffer_text.rfind('}')
-        
+        # После завершения стрима Ollama, чиним и парсим накопленный буфер
         llm_handled_ids = set()
-        
-        if start != -1 and end != -1 and end >= start:
+        if buffer_text.strip():
             try:
-                parsed_dict = json.loads(buffer_text[start:end+1])
+                # json_repair вылечит обрывы (незакрытые скобки/кавычки)
+                parsed_dict = json_repair.loads(buffer_text)
+                
                 if isinstance(parsed_dict, dict):
-                    num_keys = 0
-                    for k, v in parsed_dict.items():
-                        # Ключ может быть строкой-"числом", значение строкой-стилем
-                        if isinstance(v, str) and str(k).isdigit():
-                            pid = int(k)
-                            yield f"{json.dumps({'id': pid, 'style_name': v}, ensure_ascii=False)}\n"
-                            llm_handled_ids.add(pid)
-                            num_keys += 1
-                            success_count += 1
-                    print(f"✅ LLM Return: {num_keys} elements parsed.")
+                    print(f"✅ LLM buffer repaired & parsed. Items: {len(parsed_dict)}", flush=True)
+                    for k, llm_style_name in parsed_dict.items():
+                        if not str(k).isdigit(): continue
+                        pid = int(k)
+                        
+                        # --- ОБЪЕДИНЕНИЕ С ДАННЫМИ RAG (DNA стиля) ---
+                        # Берем параметры стиля из RAG-карты (шрифт, размер, жирность)
+                        rag_style_info = style_map.get(llm_style_name, {})
+                        
+                        # Собираем финальный объект для клиента
+                        enriched_item = {
+                            "id": pid,
+                            "style_name": llm_style_name,
+                            "font_family": rag_style_info.get("font_family"),
+                            "font_size": rag_style_info.get("font_size"),
+                            "bold": rag_style_info.get("bold", False),
+                            "align": rag_style_info.get("align", "left")
+                        }
+                        
+                        yield f"{json.dumps(enriched_item, ensure_ascii=False)}\n"
+                        llm_handled_ids.add(pid)
+                        success_count += 1
+                else:
+                    print(f"⚠️ LLM returned non-dict JSON: {type(parsed_dict)}")
             except Exception as e:
-                print(f"❌ Fallback dict parsing failed: {e}")
+                print(f"❌ JSON Repair failed for buffer: {e}")
                 
         # 4. Fallback (The Catch-All). Если LLM забыла вернуть стили для части ID,
         #    возвращаем для них "Normal", чтобы LibreOffice не "потерял" эти параграфы.

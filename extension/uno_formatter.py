@@ -1,8 +1,21 @@
 import uno
-from com.sun.star.style.ParagraphAdjust import CENTER, LEFT, RIGHT, BLOCK
-from com.sun.star.text.ControlCharacter import PARAGRAPH_BREAK
-from com.sun.star.beans import PropertyValue
 import re
+from com.sun.star.beans import PropertyValue
+from com.sun.star.awt.FontWeight import BOLD as FW_BOLD
+from com.sun.star.awt.FontWeight import NORMAL as FW_NORMAL
+from com.sun.star.awt.FontSlant import ITALIC as FS_ITALIC
+from com.sun.star.awt.FontSlant import NONE as FS_NONE
+from com.sun.star.style.ParagraphAdjust import LEFT, RIGHT, CENTER, BLOCK
+
+def _bool_to_weight(is_bold: bool):
+    return FW_BOLD if is_bold else FW_NORMAL
+
+def _bool_to_slant(is_italic: bool):
+    return FS_ITALIC if is_italic else FS_NONE
+
+ALIGNMENT_MAP = {
+    "left": LEFT, "right": RIGHT, "center": CENTER, "justify": BLOCK, "block": BLOCK
+}
 
 class UnoFormatter:
     def __init__(self, ctx):
@@ -29,22 +42,16 @@ class UnoFormatter:
             
             if "font_size" in block_data:
                 try: 
-                    # UNO ожидает высоту, иногда нужно умножать, но в python-uno обычно передается float
                     cursor.CharHeight = float(block_data["font_size"])
                 except: pass
             
             # 2. Начертание
-            if block_data.get("bold") is True: 
-                cursor.CharWeight = 150.0 # BOLD
-            if block_data.get("italic") is True: 
-                cursor.CharPosture = 1    # ITALIC
+            cursor.CharWeight = _bool_to_weight(block_data.get("bold", False))
+            cursor.CharPosture = _bool_to_slant(block_data.get("italic", False))
 
             # 3. Выравнивание
             align = block_data.get("align", "left").lower()
-            if align == "center": cursor.ParaAdjust = CENTER
-            elif align == "right": cursor.ParaAdjust = RIGHT
-            elif align in ["justify", "block"]: cursor.ParaAdjust = BLOCK
-            else: cursor.ParaAdjust = LEFT
+            cursor.ParaAdjust = ALIGNMENT_MAP.get(align, LEFT)
             
         except Exception as e:
             print(f"Formatting Error: {e}")
@@ -117,15 +124,14 @@ class UnoFormatter:
                 if "font_size" in block_data:
                     try: new_style.CharHeight = float(block_data["font_size"])
                     except: pass
-                if block_data.get("bold") is True: 
-                    new_style.CharWeight = 150.0 # BOLD
-                if block_data.get("italic") is True: 
-                    new_style.CharPosture = 1    # ITALIC
                 
-                align = block_data.get("align", "").lower()
-                if align == "center": new_style.ParaAdjust = CENTER
-                elif align == "right": new_style.ParaAdjust = RIGHT
-                elif align in ["justify", "block"]: new_style.ParaAdjust = BLOCK
+                new_style.CharWeight = _bool_to_weight(block_data.get("bold", False))
+                new_style.CharPosture = _bool_to_slant(block_data.get("italic", False))
+                
+                align = block_data.get("align", "left").lower()
+                new_style.ParaAdjust = ALIGNMENT_MAP.get(align, LEFT)
+                
+                print(f"Created style: {style_name}")
         except Exception as e:
             print(f"Style creation error: {e}")
 
@@ -143,6 +149,7 @@ class UnoFormatter:
 
         # 2. Очищаем старый текст
         cursor.setString("") 
+        from com.sun.star.text.ControlCharacter import PARAGRAPH_BREAK
         
         for block in json_structure:
             if not isinstance(block, dict): continue
@@ -198,8 +205,10 @@ class UnoFormatter:
 
             else:
                 # Обычный параграф
-                if block.get("style_name"):
-                    try: cursor.ParaStyleName = block["style_name"]
+                style_name = block.get("style_name")
+                if style_name:
+                    self.ensure_style_exists(style_name, block)
+                    try: cursor.ParaStyleName = style_name
                     except: pass
                 
                 if text_content:
