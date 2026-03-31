@@ -42,3 +42,6 @@ RAG_VIEW_*.docx
 
 # --- 5. Logs ---
 *.log
+
+# --- 6. Configuration ---
+backend/config.yaml

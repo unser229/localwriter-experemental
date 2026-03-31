@@ -1,5 +1,56 @@
 import os
 import psutil
+import yaml
+import shutil
+from pathlib import Path
+from pydantic import BaseModel
+
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+CONFIG_PATH = BACKEND_DIR / "config.yaml"
+EXAMPLE_CONFIG_PATH = BACKEND_DIR / "config.example.yaml"
+
+class ServerConfig(BaseModel):
+    host: str = "0.0.0.0"
+    port: int = 8323
+
+class OllamaConfig(BaseModel):
+    base_url: str = "http://localhost:11434"
+
+class TestConfig(BaseModel):
+    excluded_models: list[str] = ["translategemma:12b", "translategemma:latest"]
+
+class AppConfig(BaseModel):
+    server: ServerConfig = ServerConfig()
+    ollama: OllamaConfig = OllamaConfig()
+    test: TestConfig = TestConfig()
+
+def load_app_config() -> AppConfig:
+    if not CONFIG_PATH.exists():
+        if EXAMPLE_CONFIG_PATH.exists():
+            shutil.copy(EXAMPLE_CONFIG_PATH, CONFIG_PATH)
+            print(f"📄 Создан базовый config.yaml из примера.")
+        else:
+            print("⚠️ Отсутствует config.example.yaml, будут использованы значения по умолчанию.")
+    
+    yaml_data = {}
+    if CONFIG_PATH.exists():
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            yaml_data = yaml.safe_load(f) or {}
+
+    # Переопределяем параметры через переменные окружения, если они есть
+    if "OLLAMA_BASE_URL" in os.environ:
+        if "ollama" not in yaml_data:
+            yaml_data["ollama"] = {}
+        yaml_data["ollama"]["base_url"] = os.environ["OLLAMA_BASE_URL"]
+    
+    if "OLLAMA_URL" in os.environ:
+        if "ollama" not in yaml_data:
+            yaml_data["ollama"] = {}
+        yaml_data["ollama"]["base_url"] = os.environ["OLLAMA_URL"]
+
+    return AppConfig(**yaml_data)
+
+app_config = load_app_config()
 
 class HardwareProfile:
     def __init__(self):
@@ -7,8 +58,10 @@ class HardwareProfile:
         self.available_ram_gb = vm.available / (1024 ** 3)
         self.physical_cores = psutil.cpu_count(logical=False) or 2
 
-        # URL локальной Ollama — бэкенд всегда работает с ней напрямую
-        self.OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        # Используем значение из загруженного и провалидированного AppConfig
+        self.OLLAMA_BASE_URL = app_config.ollama.base_url
+        self.SERVER_HOST = app_config.server.host
+        self.SERVER_PORT = app_config.server.port
 
         # Начальная эвристика
         self.is_low_power = self.available_ram_gb < 8.0 or self.physical_cores < 6

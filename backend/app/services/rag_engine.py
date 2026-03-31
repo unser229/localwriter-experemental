@@ -4,7 +4,7 @@ import threading
 import chromadb
 from chromadb.utils import embedding_functions
 from app.services.style_extractor import style_extractor
-from app.config import settings  # <--- ВАЖНО: Добавлен этот импорт
+from app.config import settings  
 
 DB_PATH = os.path.join(os.getcwd(), "data", "vector_db")
 
@@ -108,6 +108,20 @@ class RagEngine:
                     )
                 except Exception as e:
                     print(f"⚠️ DB Write Error ({original_filename}): {e}")
+
+    def delete_document(self, original_filename: str):
+        """
+        Удаляет все чанки документа из ChromaDB по полю metadata['source'].
+        Потокобезопасно (использует тот же _lock, что и add_document).
+        Вызывается перед повторной индексацией изменённого файла
+        и при удалении файла из папки документов.
+        """
+        with self._lock:
+            try:
+                self.collection.delete(where={"source": original_filename})
+                print(f"🗑️  RAG: удалены все чанки для '{original_filename}'")
+            except Exception as e:
+                print(f"⚠️  RAG: ошибка при удалении '{original_filename}': {e}")
 
     def search(self, query_text: str, n_results: int = 5):
         """Простой поиск ближайших фрагментов"""

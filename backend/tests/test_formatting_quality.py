@@ -914,9 +914,19 @@ def save_contest_report(
 # ============================================================================
 
 def main():
+    try:
+        from app.config import app_config
+        default_server = f"http://{app_config.server.host}:{app_config.server.port}"
+        excluded_models = app_config.test.excluded_models
+    except ImportError:
+        default_server = "http://localhost:8323"
+        excluded_models = ["translategemma:12b", "translategemma:latest"]
+
     parser = argparse.ArgumentParser(description="Formatting Quality Contest")
-    parser.add_argument("--server", "-s", default="http://localhost:8323",
+    parser.add_argument("--server", "-s", default=default_server,
                         help="URL middleware сервера")
+    parser.add_argument("--ollama", "-o", default=None,
+                        help="URL Ollama (для ручного переопределения)")
     parser.add_argument("--model", "-m", default=None,
                         help="Конкретная модель (по умолчанию — все)")
     parser.add_argument("--file", "-f", default=None,
@@ -931,18 +941,11 @@ def main():
 
     print("🏁 FORMATTING QUALITY CONTEST")
     print(f"   Server: {args.server}")
+    if args.ollama:
+        print(f"   Ollama (override): {args.ollama}")
+        os.environ["OLLAMA_BASE_URL"] = args.ollama
 
-    config_path = os.path.join(os.path.dirname(__file__), "test_config.json")
-    excluded_models = ["translategemma:12b", "translategemma:latest"]
-    try:
-        if os.path.exists(config_path):
-            with open(config_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-                excluded_models = cfg.get("excluded_models", excluded_models)
-                args.server = cfg.get("server_url", args.server)
-                print(f"   🔧 Config loaded (excluded: {len(excluded_models)})")
-    except Exception:
-        pass
+    print(f"   🔧 Config loaded (excluded: {len(excluded_models)})")
 
     # --- Модели ---
     if args.model:

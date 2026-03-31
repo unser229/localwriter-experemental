@@ -1,172 +1,122 @@
-# localwriter: A LibreOffice Writer extension for local generative AI
+# LocalWriter-Experimental
 
-Consider donating to support development: https://ko-fi.com/johnbalis
+**LocalWriter-Experimental** — это расширение (extension) для LibreOffice Writer на базе Python, которое привносит "AI-форматирование" в локальные документы. Система позволяет выделить фрагмент неформатированного (сырого) текста, нажать кнопку и автоматически применить корпоративные стили (например, "Heading 1", "Normal", "Title" и пользовательские) к нужным абзацам на основе эталонных документов.
 
-## About
+---
 
-This is a LibreOffice Writer extension that enables inline generative editing with local inference. It's compatible with language models supported by `text-generation-webui` and `ollama`.
+## ✨ Главные особенности (Фичи)
 
-## Table of Contents
+1. **100% Локальность:** Работает через локальную Ollama. Ваши данные (смысл и тексты документов) остаются на устройстве и никуда не отправляются.
+2. **Умный RAG (Retrieval-Augmented Generation) для стилей:** Проект не использует жестко "захардкоженные" стили. Система парсит эталонные `.docx` (корпоративные шаблоны), сохраняет их визуальную и семантическую структуру в векторную базу (ChromaDB). При форматировании текста пользователя ИИ ищет похожие контексты в эталонах и применяет к нему точно те же стили.
+3. **Бесшовность:** Использование UNO API LibreOffice позволяет применять стили *на месте*, абзац за абзацем, без поломки остального документа (картинки, таблицы и колонтитулы остаются целыми).
+4. **Гарантированная структура (Structured Outputs):** Использование JSON Schema при обращении к LLM предотвращает галлюцинации: модель обязана возвращать структурированный JSON-ответ.
+5. **Динамическое воссоздание стилей:** Если предложенный базой стиль отсутствует в текущем "пустом" документе, макрос генерирует его на лету, применяя базовые визуальные параметры эталона (название шрифта, размер, отступы и жирность).
+6. **Асинхронность и целостность:** Оригинальные абзацы помечаются индивидуальными закладками, что гарантирует точное наложение стилей даже при долгом ответе LLM, предотвращая Race Conditions.
 
-*   [About](#about)
-*   [Table of Contents](#table-of-contents)
-*   [Features](#features)
-    *   [Extend Selection](#extend-selection)
-    *   [Edit Selection](#edit-selection)
-*   [Setup](#setup)
-    *   [LibreOffice Extension Installation](#libreoffice-extension-installation)
-    *   [Backend Setup](#backend-setup)
-        *   [text-generation-webui](#text-generation-webui)
-        *   [Ollama](#ollama)
-*   [Settings](#settings)
-*   [Contributing](#contributing)
-    *   [Local Development Setup](#local-development-setup)
-    *   [Building the Extension Package](#building-the-extension-package)
-*   [License](#license)
+---
 
-## Features
+## 🏗️ Архитектура проекта
 
-This extension provides two powerful commands for LibreOffice Writer:
+Система состоит из двух независимых частей, общающихся по HTTP-протоколу:
 
-### Extend Selection
+### 1. Бэкенд (FastAPI) — `/backend`
+"Умный Прокси" и "Умный RAG-движок", который стоит между расширением и Ollama. 
+- Написан на современном Python, управляется через **Poetry**.
+- Принимает сырой текст, корректно разбивает его на куски (батчи).
+- Обращается к локальной ChromaDB для поиска релевантных стилей из загруженных эталонных `.docx`.
+- Формирует строгий промпт и JSON-схему, и запрашивает локальную LLM (`Ollama`).
+- **Semantic Mapper** обогащает ответ LLM точными настройками исходных стилей для защиты клиента (LibreOffice) от ошибок.
 
-**Hotkey:** `CTRL + q`
+### 2. Клиент (LibreOffice Extension) — `/extension`
+Выполняется во внутреннем окружении LibreOffice (UNO).
+- Использует только стандартную библиотеку Python (`urllib`, `json`) и `uno`. Сторонние библиотеки здесь недоступны!
+- Отправляет запросы к бэкенду через собственный чистый HTTP-клиент (вынесен в `client.py`).
+- Осуществляет взаимодействие с XModel документа. Размечает абзацы закладками перед отправкой.
+- Применяет форматирование по мере получения (стриминга) ответов от Backend-сервера.
 
-*   This uses a language model to predict what comes after the selected text. There are a lot of ways to use this.
-*   Some example use cases for this include: writing a story or an email given a particular prompt, adding additional possible items to a grocery list, or summarizing the selected text.
+---
 
-### Edit Selection
+## 🚀 Руководство к использованию (Установка и Запуск)
 
-**Hotkey:** `CTRL + e`
+### Требования
+- **Python:** Версии 3.11 или 3.12 (внимание: с версией 3.13 могут быть проблемы совместимости библиотек).
+- **Окружение:** `poetry` (обязательно для бэкенда).
+- **LibreOffice:** Желательно актуальной версии с поддержкой макросов на Python.
+- **Ollama:** Локально запущенная нейросеть (базовый порт `11434`).
 
-*   A dialog box appears to prompt the user for instructions about how to edit the selected text, then the selected text is replaced by the edited text.
-*   Some examples for use cases for this include changing the tone of an email, translating text to a different language, and semantically editing a scene in a story.
+### Шаг 1: Запуск Backend-сервера
+Сервер необходим для связи LibreOffice и Ollama, а также для работы RAG-движка. В боевых условиях сервер должен быть всегда запущен.
 
-## Setup
+1. Перейдите в директорию бэкенда:
+   ```bash
+   cd backend
+   ```
+2. Установите зависимости:
+   ```bash
+   poetry install
+   ```
+3. Запустите сервер (используется uvicorn):
+   ```bash
+   poetry run uvicorn app.main:app --host 0.0.0.0 --port 8323 --reload
+   ```
+   Сервер запустится на `http://localhost:8323` и попытается найти Ollama на `http://localhost:11434`. 
+   *(Если Ollama на другом хосте, запустите сервер с `OLLAMA_URL="http://192.168.1.100:11434" poetry run ...`)*.
 
-### LibreOffice Extension Installation
+### Шаг 2: Сборка и установка расширения LibreOffice
 
-1.  Download the latest version of Localwriter via the [releases page](https://github.com/balisujohn/localwriter/releases).
-2.  Open LibreOffice.
-3.  Navigate to `Tools > Extensions`.
-4.  Click `Add` and select the downloaded `.oxt` file.
-5.  Follow the on-screen instructions to install the extension.
+Для автоматической упаковки расширения в `.oxt` и установки в LibreOffice используется специальный bash-скрипт.
+**Важно:** Во время выполнения скрипта все процессы LibreOffice в системе будут принудительно завершены! Обязательно сохраните документы.
 
-### Backend Setup
+1. Из корня проекта выполните:
+   ```bash
+   ./scripts/deploy.sh
+   ```
+   **Скрипт по шагам сделает следующее:**
+   - Очистит lock-файлы и закроет LibreOffice.
+   - Запакует `extension/` в файл `localwriter.oxt` внутри `/build`.
+   - Удалит старое расширение через `unopkg`.
+   - Установит новое и автоматически откроет LibreOffice Writer для работы.
+   - Откроет просмотр системных логов расширения на клиенте (`/tmp/localwriter.log`).
 
-To use Localwriter, you need a backend model runner.  Options include `text-generation-webui` and `Ollama`. Choose the backend that best suits your needs. Ollama is generally easier to set up. In either of these options, you will have to download and set a model. 
+### Шаг 3: Настройка и работа с приложением
 
-#### text-generation-webui
+1. В LibreOffice на верхней панели найдите меню **LocalWriter**.
+2. Убедитесь, что расширение ссылается на развернутый бэкенд (состояние сервера можно проверить, перейдя по `http://localhost:8323/api/tags` - должен вернуться список моделей).
+3. Выделите неформатированный участок вашего документа.
+4. Нажмите **"Apply Template"** (или воспользуйтесь выставленной горячей клавишей, например `CTRL + e` / `CTRL + q` в зависимости от настроек).
+5. Система проанализирует текст, пошлет запрос в бэкенд, и стили будут на лету применены к выбранным абзацам.
 
-*   Installation instructions can be found [here](https://github.com/oobabooga/text-generation-webui).
-*   Docker image available [here](https://github.com/Atinoda/text-generation-webui-docker).
+*Для добавления новых корпоративных шаблонов эталонов, используйте API бэкенда `POST /api/ingest`, отправляя `.docx` файлы.*
 
-After installation and model setup:
+---
 
-1.  Enable the local OpenAI API (this ensures the API responds in a format similar to OpenAI).
-2.  Verify that the intended model is working (e.g., openchat3.5, suitable for 8GB VRAM setups).
-3.  Set the endpoint in Localwriter to `localhost:5000` (or the configured port).
+## 🛠️ Разработка и Тестирование
 
-#### Ollama
+### Основные правила проекта
+1. Управление зависимостями: Всегда используйте **Poetry** в бэкенде (`poetry add package`).
+2. Ограничения клиента: Внутри `/extension/` запрещены любые пакеты, требующие pip. Доступны только `uno` и stdlib Python.
+3. Язык: Вся архитектура, комментарии разработчиков и планы должны быть на русском языке.
 
-*   Installation instructions are available [here](https://ollama.com/).
-*   Download and use a model (gemma3 isn't bad)
-*   Ensure the API is enabled.
-*   Set the endpoint in Localwriter to `localhost:11434` (or the configured port).
-*   Manually set the model name. ([This is required for Ollama to work](https://ask.libreoffice.org/t/localwriter-0-0-5-installation-and-usage/122241/5?u=jbalis))
+### Инструкция к E2E-тестам
+В проекте принята строгая политика проведения тестов **(Zero-Mock Policy)**. Вместо моков используется прямое подключение (имитация) боевого клиента `extension/client.py`.
 
-## Settings
+Как правильно запустить тесты качества:
+1. Запустили бэкенд в фоне (`poetry run uvicorn ... &`).
+2. Проверили Healthcheck (сервер отвечает).
+3. Из папки бэкенда исполняем тест:
+   ```bash
+   poetry run python tests/test_formatting_quality.py
+   ```
+   Тест проанализирует эталонные файлы (Ingest), выработает "идеальное форматирование" (Ground Truth) и сравнит результат работы LLM с эталоном. Любой сбой в цепочке приводит к падению теста со статусом Exit 1. Ложные срабатывания недопустимы!
 
-In the settings, you can configure:
+---
 
-*   Maximum number of additional tokens for "Extend Selection."
-*   Maximum number of additional tokens (above the number of letters in the original selection) for "Edit Selection."
-*   Custom "system prompts" for both "Extend Selection" and "Edit Selection." These prompts are prepended to the selection before sending it to the language model.  For example, you can use a sample of your writing to guide the model's style.
+## 🗺️ Дальнейшее развитие (Roadmap)
 
-## Contributing
-
-Help with development is always welcome. localwriter has a number of outstanding feature requests by users. Feel free to work on any of them, and you can help improve freedom-respecting local AI.
-
-### Local Development Setup
-
-For developers who want to modify or contribute to Localwriter, you can run and test the extension directly from your source code without packaging it into an `.oxt` file. This allows for quick iteration and seeing changes reflected in the LibreOffice UI.
-
-1. **Clone the Repository (if not already done):**
-   - Clone the Localwriter repository to your local machine if you haven't already:
-     ```
-     git clone https://github.com/balis-john/localwriter.git
-     cd localwriter
-     ```
-
-2. **Register the Extension Temporarily:**
-   - Use the `unopkg` tool to register the extension directly from your repository folder. This avoids the need to package the extension as an `.oxt` file during development.
-   - Run the following command, replacing `/path/to/localwriter/` with the path to your cloned repository:
-     ```
-     unopkg add /path/to/localwriter/
-     ```
-   - On Linux, `unopkg` is often located at `/usr/lib/libreoffice/program/unopkg`. Adjust the command if needed:
-     ```
-     /usr/lib/libreoffice/program/unopkg add /path/to/localwriter/
-     ```
-
-3. **Restart LibreOffice:**
-   - Close and reopen LibreOffice Writer or Calc. You should see the "localwriter" menu with options like "Extend Selection", "Edit Selection", and "Settings" in the menu bar.
-
-4. **Make and Test Changes:**
-   - Edit the source files (e.g., `main.py`) directly in your repository folder using your preferred editor.
-   - After making changes, restart LibreOffice to reload the updated code. Test the functionality and UI elements (dialogs, menu actions) directly in LibreOffice.
-   - Note: Restarting is often necessary for Python script changes to take effect, as LibreOffice caches modules.
-
-5. **Commit Changes to Git:**
-   - Since you're working directly in your Git repository, commit your changes as needed:
-     ```
-     git add main.py
-     git commit -m "Updated extension logic for ExtendSelection"
-     ```
-
-6. **Unregister the Extension (Optional):**
-   - If you need to remove the temporary registration, use:
-     ```
-     unopkg remove org.extension.sample
-     ```
-   - Replace `org.extension.sample` with the identifier from `description.xml` if different.
-
-### Building the Extension Package
-
-To create a distributable `.oxt` package:
-
-In a terminal, change directory into the localwriter repository top-level directory, then run the following command:
-
-````
-zip -r localwriter.oxt \
-  Accelerators.xcu \
-  Addons.xcu \
-  assets \
-  description.xml \
-  main.py \
-  META-INF \
-  registration \
-  README.md
-````
-
-This will create the file `localwriter.oxt` which you can open with libreoffice to install the localwriter extension. You can also change the file extension to .zip and manually unzip the extension file, if you want to inspect a localwriter `.oxt` file yourself. It is all human-readable, since python is an interpreted language.
-
-
-
-## License 
-
-(See `License.txt` for the full license text)
-
-Except where otherwise noted in source code, this software is provided with a MPL 2.0 license.
-
-The code not released with an MPL2.0 license is released under the following terms.
-License: Creative Commons Attribution-ShareAlike 3.0 Unported License,
-License: The Document Foundation  https://creativecommons.org/licenses/by-sa/3.0/
-
-A large amount of code is derived from the following MPL2.0 licensed code from the Document Foundation
-https://gerrit.libreoffice.org/c/core/+/159938 
-
-
-MPL2.0
-
-Copyright (c) 2024 John Balis
+В целях снижения нагрузки на контекстное окно LLM планируется переход на многоуровневую семантическую классификацию:
+1. **Жесткий Enum ролей для LLM**: Отвязка RAG от LLM. Модель будет решать лишь к какой из базовых ролей относится абзац (`[TITLE, SUBTITLE, BODY, LIST_ITEM]`).
+2. **Python-Маппинг стилей**: RAG-поиск будет происходить исключительно на уровне Python в бэкенде, преобразуя абстрактные классификации LLM в реальные корпоративные названия стилей конкретного эталона перед отправкой в LibreOffice. Это полностью уберет галлюцинации и снизит требования к LLM до моделей с 1.5-2B параметрами.
+3. Интеграция с [ООО Development Tools](https://github.com/Amourspirit/python_ooo_dev_tools/blob/main/README.rst) для более гибкой генерации UNO-стилей.
+4. Добавление функциональности **"Черновик в Документ"**: Интеграция с Pandoc для перевода голого Markdown-черновика в идеально оформленный корпоративный `.docx`.
+5. Автоматический поиск и предложение реквизитов документа по базе без участия LLM.
+6. Внедрение собственного GUI-компонента в LibreOffice для удобного управления.
